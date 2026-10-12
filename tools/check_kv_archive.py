@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Author: Maurizio Verde — LastReload (cold-archive check)
 """Confirm that `kv_archive` is working, and how much it saves.
 
 STRICTLY READ-ONLY: it does not archive, does not delete, does not touch the engine,
@@ -33,6 +34,8 @@ Usage:
     .venv314/bin/python tools/check_kv_archive.py --restore-check
                                                               # prove the restore rebuilds
                                                                 a byte-identical .bin (sha256)
+
+Note: Strata-only for now (the archive format and the slot layout are Strata's).
 """
 from __future__ import annotations
 

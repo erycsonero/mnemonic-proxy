@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Author: Maurizio Verde — LastReload (measurement protocol after LastReload)
 """Measure the automatic restore of the engine's saved state, without restarting the engine.
 
 The proxy restores a saved state when the engine loses the conversation. The triggers are
@@ -42,6 +43,8 @@ Usage:
 
 Requires an OpenAI-compatible engine with saved state already running (Strata >= 0.1.40
 with slot_save_path in the config, or llama-server with --slot-save-path).
+
+Note: Strata-only for now (the journal events it reads are Strata's).
 """
 from __future__ import annotations
 

@@ -736,6 +736,42 @@ alone and the proxy uses `history_recall` (or `load_tools`) instead.
      `python3 -m ctxproxy.kvarchive --root /path/to/kv-archive gc` to drop unreferenced blocks;
   5. the journal is append-only: delete or filter `data/journal.jsonl` (lines with `"conv": "<id>"`).
 
+## Tools: audit the archive and measure restore
+
+Two stand-alone tools, Strata-only for now. Both are read-only against the archive and
+never restart the engine; run them with the Python that has the archive support
+(`.venv314`).
+
+**`tools/check_kv_archive.py`** — is the cold archive healthy, and what is it saving?
+
+```sh
+.venv314/bin/python tools/check_kv_archive.py                 # snapshot now
+.venv314/bin/python tools/check_kv_archive.py --restore-check  # rebuild each archive, compare sha256
+.venv314/bin/python tools/check_kv_archive.py --watch          # follow until it archives
+```
+
+It reports the `sessions/` files, the `kv-archive/` usage with dedup, and how far the
+archiver is from firing (engine idle, file age, file size). It never creates the archive
+directories and never writes to disk: `--restore-check` restores into a private temp dir.
+Exit code 0 when everything is fine, 1 on a problem (a corrupt block, a failed restore,
+a `--watch` that never archived), 2 on a usage error.
+
+**`tools/measure_restore.py`** — how much does the automatic restore save?
+
+```sh
+.venv314/bin/python tools/measure_restore.py --allow-shared-engine
+```
+
+It runs two phases against the same live engine: **control** (autorestore off) gives the
+real re-read in `prompt_ms`, **restore** (autorestore on) gives `restore_ms` + the
+`prompt_ms` of the few new tokens, both from the journal — the speed-up is
+`control_ms / (restore_ms + new_ms)`, not an extrapolation. On an RTX 5060 Ti with
+swift-1.5-iq3_xxs (window 131072, prompt ~32K tokens) it measured **6.5x** (re-read
+30.6 s vs restore + new tokens 4.7 s). It needs `--allow-shared-engine` because filling
+the engine with conversation B evicts other sessions, and it removes only the `.bin`
+files it created itself. Exit code 0 when a restore was measured, 1 when nothing was
+restored, 2 on a usage error.
+
 ## Tests
 
 ```sh
@@ -747,6 +783,12 @@ Uses a fake OpenAI-compatible engine (`tests/fake_engine.py`, also runnable stan
 counting (a tokenizer in `./tok` or `CTX_TOKDIR`, plus `tokenizers`), Strata mock integration (`STRATA_DIR`, plus
 `jinja2`), and `kv_archive` (Python ≥ 3.14). `tools/replay_dry.py` and `tools/replay_exact.py` replay a pi session
 through the context manager offline.
+
+The two Strata tools have their own tests: `tests/test_kv_archive.py` and
+`tests/test_check_kv_archive.py` build a real archive with the same in-memory helper (no engine
+needed) and check that the audit detects a corrupt block, exits non-zero, and touches nothing;
+`tests/test_measure_restore.py` covers the pure logic (journal filtering, the speed-up from
+`prompt_ms` / `restore_ms`, the CLI guards). The `kv_archive` group needs Python ≥ 3.14.
 
 Partly in Italian: code comments, the dashboard UI and the developer notes in `docs/dev-notes/`. Since 0.3.1 every
 text the proxy writes into the model's prompt — receipts and placeholders of hidden content, the handoff-note
