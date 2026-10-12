@@ -81,8 +81,9 @@ safe_venv()
     *) return 1 ;;
   esac
   [ -L "$v" ] && return 1
-  # o caminho escrito comeca com $ROOT, mas o FISICO e' o que o rm -rf vai seguir:
-  # resolve o pai (ou a propria pasta, se existe) e exige que esteja dentro de $ROOT
+  # the written path starts with $ROOT, but the PHYSICAL one is what rm -rf will
+  # follow: resolve the parent (or the folder itself, if it exists) and require
+  # it to be inside $ROOT
   if [ -d "$v" ]; then
     phys=$(cd "$v" 2>/dev/null && pwd -P) || return 1
   else

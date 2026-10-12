@@ -1,19 +1,20 @@
-"""Testa setup.sh e run-strata-proxy.sh (a camada de um clique, sem tocar no motor).
+"""Tests for setup.sh and run-strata-proxy.sh (the one-click layer, without touching the engine).
 
-Cobre os pontos da revisao:
-  1. o fluxo funciona sem Python 3.14: o config criado nasce com kv_archive DESLIGADO
-     (opt-in via KV_ARCHIVE=1), e um config pessoal que pede kv_archive sem suporte
-     faz o script falhar com mensagem clara sem ser sobrescrito;
-  2. a checagem do motor aceita so 2xx e distingue conexao/timeout de HTTP 4xx/5xx;
-  3. nenhum rm -rf em caminho arbitrario: VENV_MAIN / VENV_KV fora do projeto, com "..",
-     symlink, ou pasta que nao e venv, sao recusados antes de qualquer remocao;
-  4. privilegios: sem Python o padrao e' mostrar o comando do gerenciador detectado e
-     parar (sem sudo); --install_deps roda — direto como root, via sudo fora de root;
-  5. os testes nao dependem da versao do Python da maquina: os stubs interceptam a
-     sonda `import compression.zstd`, e os venvs reais a escondem via sitecustomize.
+Covers the review points:
+  1. the flow works without Python 3.14: a created config is born with kv_archive OFF
+     (opt-in via KV_ARCHIVE=1), and a personal config asking for kv_archive without
+     support makes the script fail with a clear message without being overwritten;
+  2. the engine check accepts only 2xx and tells connection/timeout apart from HTTP 4xx/5xx;
+  3. no rm -rf on an arbitrary path: VENV_MAIN / VENV_KV outside the project, with "..",
+     a symlink, or a folder that is not a venv, are refused before any removal;
+  4. privileges: without Python the default is to print the command of the detected
+     package manager and stop (no sudo); --install-deps runs it — directly as root,
+     via sudo otherwise;
+  5. the tests do not depend on the host Python version: the stubs intercept the
+     `import compression.zstd` probe, and real venvs hide it via sitecustomize.
 
-Os testes usam venvs reais criados por `python -m venv` (rapido) e um stub de
-`mnemonic-proxy` que nao sobe servidor: o que se testa e a casca, nao o proxy.
+The tests use real venvs created by `python -m venv` (fast) and a stub
+`mnemonic-proxy` that does not start a server: what is tested is the shell, not the proxy.
 """
 import glob
 import json
@@ -37,7 +38,7 @@ def run(cmd, cwd, env=None, timeout=180):
 
 
 def make_tree():
-    """copia o baseline rastreado (pyproject, ctxproxy, examples) + os scripts atuais."""
+    """copy the tracked baseline (pyproject, ctxproxy, examples) + the current scripts."""
     tmp = tempfile.mkdtemp(prefix="mp-shell-")
     r = subprocess.run(["git", "archive", "HEAD"], cwd=ROOT, capture_output=True)
     if r.returncode != 0:
@@ -49,11 +50,11 @@ def make_tree():
 
 
 def stub_venv(tree, name, kv=False):
-    """venv com bin/python e bin/mnemonic-proxy (stub que nao sobe servidor).
+    """venv with bin/python and bin/mnemonic-proxy (a stub that starts no server).
 
-    O python e' um wrapper do real que intercepta APENAS a sonda `import
-    compression.zstd`: kv=True passa, kv=False falha — assim o teste nao depende
-    da versao do Python da maquina (um host 3.14 nao liga o kv "de graca").
+    The python is a wrapper around the real one that intercepts ONLY the `import
+    compression.zstd` probe: kv=True passes, kv=False fails — so the test does not
+    depend on the host Python version (a 3.14 host does not turn kv on "for free").
     """
     d = os.path.join(tree, name)
     binp = os.path.join(d, "bin")
@@ -74,10 +75,10 @@ def stub_venv(tree, name, kv=False):
 
 
 def hide_zstd(venv):
-    """Bloqueia `import compression.zstd` dentro de um venv REAL via sitecustomize.
+    """Block `import compression.zstd` inside a REAL venv via sitecustomize.
 
-    O bin/python do venv fica intacto (pip e venv continuam corretos); so a sonda
-    do kv_archive ve um Python pre-3.14, em qualquer maquina.
+    The venv's bin/python stays untouched (pip and venv keep working correctly);
+    only the kv_archive probe sees a pre-3.14 Python, on any machine.
     """
     sp = glob.glob(os.path.join(venv, "lib", "python*", "site-packages"))
     with open(os.path.join(sp[0], "sitecustomize.py"), "w", encoding="utf-8") as fh:
@@ -95,7 +96,7 @@ def tmp_abs(tree, name):
 
 
 def strata_dir(tree, slot_path):
-    """pasta do 'Strata' com um JSON de modelo que declara slot_save_path."""
+    """a 'Strata' folder with one model JSON declaring slot_save_path."""
     d = os.path.join(tree, "strata")
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "modelo.json"), "w", encoding="utf-8") as fh:
@@ -104,11 +105,11 @@ def strata_dir(tree, slot_path):
 
 
 def strata_configs(tree, name, items):
-    """pasta do 'Strata' com varios JSON de motor: items = [(model, tokenizer, port, slot)].
+    """a 'Strata' folder with several engine JSONs: items = [(model, tokenizer, port, slot)].
 
-    Simula a instalação com mais de um pack: cada config aponta o tokenizer e o
-    slot do proprio pack, e o lancador tem de escolher o arquivo do motor em uso,
-    nao o primeiro em ordem alfabetica.
+    Simulates a multi-pack install: each config points to its own pack's tokenizer
+    and slot dir, and the launcher must pick the file of the engine in use, not
+    the first one in alphabetical order.
     """
     d = os.path.join(tree, name)
     os.makedirs(d, exist_ok=True)
@@ -135,7 +136,7 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             self.wfile.write(body)
         except Exception:
-            pass                      # il cliente ha gia' chiuso (timeout): rumore di serie
+            pass                      # the client already hung up (timeout): expected noise
 
     def log_message(self, *a):
         pass
@@ -151,7 +152,7 @@ def serve(code=200, sleep=0.0, body=None):
 
 
 class RunScriptTests(unittest.TestCase):
-    """run-strata-proxy.sh: venv por suporte, config criado coerente, checagem do motor."""
+    """run-strata-proxy.sh: venv chosen by support, coherent created config, engine check."""
 
     def setUp(self):
         self.tree = make_tree()
@@ -184,9 +185,9 @@ class RunScriptTests(unittest.TestCase):
         return rc, out
 
     def test_tokenizer_deduzido_do_config_do_motor(self):
-        """TOKENIZER non e' obbligatorio: il lancatore lo legge dalla chiave "tokenizer"
-        del JSON del motore, come gia' fa con slot_save_path. Nessun percorso personale
-        nel lancatore: chi ha il motore in una cartella qualsiasi lo trova da solo."""
+        """TOKENIZER is not mandatory: the launcher reads it from the "tokenizer" key
+        of the engine JSON, as it already does with slot_save_path. No personal path
+        in the launcher: whoever has the engine in any folder finds it automatically."""
         stub_venv(self.tree, ".venv")
         tok = os.path.join(self.tree, "tok_auto")
         os.makedirs(tok, exist_ok=True)
@@ -199,9 +200,9 @@ class RunScriptTests(unittest.TestCase):
         self.assertIn("--tokenizer " + tok, out)
 
     def test_sem_tokenizer_o_proxy_sobe_sem_o_argumento(self):
-        """Nessun tokenizer nel config del motore: il lancatore non deve passare
-        --tokenizer. Il proxy conta caratteri / chars_per_token, che e' la stima
-        documentata - non un errore, e non si passa un path vuoto."""
+        """No tokenizer in the engine config: the launcher must not pass --tokenizer.
+        The proxy counts chars / chars_per_token, which is the documented estimate —
+        not an error, and no empty path is passed."""
         stub_venv(self.tree, ".venv")
         rc, out = self.boot(extra={"TOKENIZER": ""})
         self.assertEqual(rc, 0, out)
@@ -209,10 +210,10 @@ class RunScriptTests(unittest.TestCase):
         self.assertIn("chars/3.5", out)
 
     def test_dois_configs_sem_identificacao_nao_escolhe_nada(self):
-        """Dois packs na pasta do motor, nenhum identificador do motor em uso: o
-        lancador nao passa --tokenizer e nao deduz slot_dir. Um arquivo de outro
-        pack daria numeros errados e sessoes no lugar errado; a estimativa
-        chars/3.5 e o sessions da pasta do Strata sao mais honestos."""
+        """Two packs in the engine folder, no identifier of the engine in use: the
+        launcher passes no --tokenizer and deduces no slot_dir. A file from another
+        pack would give wrong numbers and sessions in the wrong place; the chars/3.5
+        estimate and the Strata folder's sessions are more honest."""
         stub_venv(self.tree, ".venv")
         d = strata_configs(self.tree, "multi",
                            [("coder", os.path.join(self.tree, "tokA"), 8081,
@@ -221,8 +222,8 @@ class RunScriptTests(unittest.TestCase):
                              os.path.join(self.tree, "sessB"))])
         rc, out = self.boot(extra={"TOKENIZER": "", "STRATA_DIR": d})
         self.assertEqual(rc, 0, out)
-        # la riga del proxy e' quella che conta: l'avviso parla di --tokenizer, la
-        # chiamata no.
+        # the proxy line is the one that counts: the warning mentions --tokenizer,
+        # the call does not.
         stub = [l for l in out.splitlines() if l.startswith("[stub mnemonic-proxy]")]
         self.assertEqual(len(stub), 1, out)
         self.assertNotIn("--tokenizer", stub[0])
@@ -235,9 +236,9 @@ class RunScriptTests(unittest.TestCase):
         self.assertEqual(self.read_config()["slot_dir"], os.path.join(d, "sessions"))
 
     def test_dois_configs_com_mesmo_model_name_nao_escolhe_nada(self):
-        """Dois arquivos que declaram o MESMO model_name, com tokenizer e slot
-        proprios: o 'model' do motor nao desempata (casa os dois) e a porta da URL
-        nao casa nenhum. Nada e escolhido -- dois candidatos, um lancador honesto."""
+        """Two files declaring the SAME model_name, each with its own tokenizer and
+        slot: the engine's 'model' does not break the tie (it matches both) and the
+        URL port matches none. Nothing is chosen — two candidates, an honest launcher."""
         stub_venv(self.tree, ".venv")
         d = strata_configs(self.tree, "multi",
                            [("swift", os.path.join(self.tree, "tokB"), 8080,
@@ -260,9 +261,9 @@ class RunScriptTests(unittest.TestCase):
         self.assertEqual(self.read_config()["slot_dir"], os.path.join(d, "sessions"))
 
     def test_model_do_motor_escolhe_tokenizer_e_slot_do_mesmo_pack(self):
-        """Com dois configs, o 'model' de /v1/status decide o arquivo: tokenizer e
-        slot_dir vem do MESMO pack (o do motor em uso), nao do primeiro em ordem
-        alfabetica (coder vem antes de swift, e e' justamente o que nao queremos)."""
+        """With two configs, the 'model' from /v1/status decides the file: tokenizer and
+        slot_dir come from the SAME pack (the one of the engine in use), not from the
+        first in alphabetical order (coder sorts before swift, exactly what we don't want)."""
         stub_venv(self.tree, ".venv")
         d = strata_configs(self.tree, "multi",
                            [("coder", os.path.join(self.tree, "tokA"), 8081,
@@ -277,8 +278,8 @@ class RunScriptTests(unittest.TestCase):
         self.assertEqual(self.read_config()["slot_dir"], os.path.join(self.tree, "sessB"))
 
     def test_porta_da_url_escolhe_tokenizer_e_slot_do_mesmo_pack(self):
-        """Sem 'model' em /v1/status, a porta da URL identifica o arquivo: tokenizer
-        e slot_dir vem do MESMO pack, o que tem o port igual ao do STRATA_URL."""
+        """Without 'model' in /v1/status, the URL port identifies the file: tokenizer
+        and slot_dir come from the SAME pack, the one whose port matches STRATA_URL."""
         stub_venv(self.tree, ".venv")
         url, srv = serve(200)
         try:
@@ -299,8 +300,8 @@ class RunScriptTests(unittest.TestCase):
         self.assertEqual(self.read_config()["slot_dir"], os.path.join(self.tree, "sessB"))
 
     def test_arquivo_unico_da_pasta_preserva_o_comportamento(self):
-        """Um unico JSON na pasta do motor: tokenizer e slot_dir daquele arquivo,
-        exatamente como antes da regra de identificacao."""
+        """A single JSON in the engine folder: tokenizer and slot_dir from that file,
+        exactly as before the identification rule."""
         stub_venv(self.tree, ".venv")
         tok = os.path.join(self.tree, "tok_uno")
         slot = os.path.join(self.tree, "sess_uno")
@@ -314,8 +315,8 @@ class RunScriptTests(unittest.TestCase):
         self.assertEqual(self.read_config()["slot_dir"], slot)
 
     def test_sem_slot_save_path_as_sessoes_vao_para_a_pasta_do_strata(self):
-        """JSON sem slot_save_path: nada e inventado. O slot cai na convencao
-        $STRATA_DIR/sessions e o tokenizer continua a vir do mesmo arquivo."""
+        """A JSON without slot_save_path: nothing is invented. The slot falls back to
+        the $STRATA_DIR/sessions convention and the tokenizer still comes from the same file."""
         stub_venv(self.tree, ".venv")
         tok = os.path.join(self.tree, "tok_noslot")
         os.makedirs(tok, exist_ok=True)
@@ -327,8 +328,8 @@ class RunScriptTests(unittest.TestCase):
         self.assertEqual(self.read_config()["slot_dir"], os.path.join(self.strata, "sessions"))
 
     def test_tokenizer_e_slot_dir_explicitos_tem_precedencia(self):
-        """TOKENIZER e SLOT_DIR dados por quem chama mandam, mesmo com dois configs
-        e um motor que nao se identifica: a descoberta nao os sobrescreve."""
+        """TOKENIZER and SLOT_DIR given by the caller win, even with two configs and
+        an engine that does not identify itself: the discovery does not overwrite them."""
         stub_venv(self.tree, ".venv")
         d = strata_configs(self.tree, "multi",
                            [("coder", os.path.join(self.tree, "tokA"), 8081,
@@ -348,17 +349,17 @@ class RunScriptTests(unittest.TestCase):
                          os.path.join(self.tree, "sess_escolhida"))
 
     def test_sem_python_314_sobe_e_cria_config_sem_kv(self):
-        stub_venv(self.tree, ".venv")                      # python sem compression.zstd
+        stub_venv(self.tree, ".venv")                      # python without compression.zstd
         rc, out = self.boot()
         self.assertEqual(rc, 0, out)
         cfg = self.read_config()
-        self.assertIs(cfg["kv_archive"], False, "config criado nao pode pedir kv sem suporte")
+        self.assertIs(cfg["kv_archive"], False, "a created config must not ask for kv without support")
         self.assertEqual(cfg["slot_dir"], os.path.join(self.tree, "sessions"))
         self.assertIn("kv_archive=off", out)
 
     def test_com_suporte_o_config_nasce_com_kv_off_e_avisa_como_ligar(self):
-        """kv_archive e' opt-in (experimental): mesmo com Python 3.14 disponivel o
-        config criado nasce com kv_archive=false, e a saida mostra como ligar."""
+        """kv_archive is opt-in (experimental): even with Python 3.14 available the
+        created config is born with kv_archive=false, and the output shows how to enable it."""
         stub_venv(self.tree, ".venv314", kv=True)
         rc, out = self.boot()
         self.assertEqual(rc, 0, out)
@@ -374,8 +375,8 @@ class RunScriptTests(unittest.TestCase):
         self.assertIn("kv_archive=on", out)
 
     def test_kv_opt_in_sem_suporte_cria_config_sem_kv_e_avisa(self):
-        """KV_ARCHIVE=1 sem Python 3.14: o config nasce sem kv e o motivo e' impresso."""
-        stub_venv(self.tree, ".venv")                        # sonda zstd bloqueada pelo stub
+        """KV_ARCHIVE=1 without Python 3.14: the config is born without kv and the reason is printed."""
+        stub_venv(self.tree, ".venv")                        # zstd probe blocked by the stub
         rc, out = self.boot(extra={"KV_ARCHIVE": "1"})
         self.assertEqual(rc, 0, out)
         self.assertIs(self.read_config()["kv_archive"], False)
@@ -391,8 +392,8 @@ class RunScriptTests(unittest.TestCase):
         self.assertIn("kv_archive=on", out)
 
     def test_slot_dir_ausente_avisa_sem_falhar(self):
-        """O slot_dir efetivo e' impresso; se a pasta nao existe, aviso com o mkdir
-        (o saved state nao tem onde escrever), mas o proxy sobe."""
+        """The effective slot_dir is printed; if the folder does not exist, a warning
+        with the mkdir command (saved state has nowhere to write), but the proxy starts."""
         stub_venv(self.tree, ".venv")
         rc, out = self.boot()
         self.assertEqual(rc, 0, out)
@@ -416,7 +417,7 @@ class RunScriptTests(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertIn("compression.zstd", out)
         self.assertIn("was not modified", out)
-        self.assertEqual(open(self.cfg, "rb").read(), antes, "config pessoal nao pode ser alterado")
+        self.assertEqual(open(self.cfg, "rb").read(), antes, "a personal config must not be modified")
         self.assertEqual(self.read_config()["slot_dir"], "/meu/slot")
 
     def test_config_pessoal_sem_kv_sobe_sem_314(self):
@@ -467,8 +468,8 @@ class RunScriptTests(unittest.TestCase):
         self.assertIn("connection", out)
 
     def test_timeout_invalido_sem_curl_nao_inventa_http(self):
-        """Senza curl il probe cade sul python: un PROBE_TIMEOUT non numerico non deve
-        dare un codice HTTP vuoto, che verrebbe letto come 'la porta ha risposto'."""
+        """Without curl the probe falls back to python: a non-numeric PROBE_TIMEOUT must
+        not produce an empty HTTP code, which would be read as 'the port answered'."""
         stub_venv(self.tree, ".venv")
         self.write_config({"slot_dir": "/meu/slot", "kv_archive": False})
         nobin = os.path.join(self.tree, "nobin")
@@ -486,7 +487,7 @@ class RunScriptTests(unittest.TestCase):
 
 
 def python_sem_pip(path):
-    """python que falha em `-m pip`: e o que um venv parado no meio mostra ao setup.sh."""
+    """a python that fails on `-m pip`: what an interrupted venv looks like to setup.sh."""
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("#!/bin/sh\n"
                  "if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"pip\" ]; then exit 1; fi\n"
@@ -495,7 +496,7 @@ def python_sem_pip(path):
 
 
 class SetupScriptTests(unittest.TestCase):
-    """setup.sh: checagem sem Python 3.14 e caminhos vigiados antes de qualquer rm -rf."""
+    """setup.sh: checking without Python 3.14 and watched paths before any rm -rf."""
 
     def setUp(self):
         self.tree = make_tree()
@@ -526,7 +527,7 @@ class SetupScriptTests(unittest.TestCase):
 
     def test_check_passa_sem_python_314(self):
         venv = self.real_venv(".venv")
-        hide_zstd(venv)          # independente do Python da maquina (rev. ponto 5)
+        hide_zstd(venv)          # independent of the host Python (review point 5)
         rc, out = self.setup(["--check"])
         self.assertEqual(rc, 0, out)
         self.assertIn("kv_archive (zstd)", out)
@@ -546,10 +547,10 @@ class SetupScriptTests(unittest.TestCase):
         self.assertIn(": no", out)
         self.assertNotIn("creating %s" % os.path.join(self.tree, ".venv314"), out)
         self.assertNotIn("building .venv314", out)
-    # ---- privilegios (rev. pontos 1, 2 e 6) ---------------------------------
-    # Um PATH minimo, SEM python: os coreutils que o setup.sh usa antes da etapa do
-    # Python (dirname, id), stubs com log para o gerenciador de pacotes e para o
-    # sudo. Assim se prova O QUE seria rodado, sem instalar nada de verdade.
+    # ---- privileges (review points 1, 2 and 6) -------------------------------
+    # A minimal PATH with NO python: the coreutils setup.sh uses before the Python
+    # step (dirname, id), plus logging stubs for the package manager and for sudo.
+    # This proves WHAT would be run, without actually installing anything.
     def shim_bin(self, pm="apt", root=False):
         d = os.path.join(self.tree, "shimbin")
         os.makedirs(d, exist_ok=True)
@@ -581,19 +582,20 @@ class SetupScriptTests(unittest.TestCase):
             return fh.read()
 
     def test_sem_python_o_padrao_e_mostrar_o_comando_e_parar(self):
-        """Sem Python e sem --install-deps: o script imprime o comando do gerenciador
-        detectado e sai 1 — sem chamar sudo nem o gerenciador (rev. ponto 6)."""
+        """Without Python and without --install-deps: the script prints the command of
+        the detected package manager and exits 1 — calling neither sudo nor the
+        package manager (review point 6)."""
         d = self.shim_bin(pm="apt")
         rc, out = self.setup(env={"PATH": d})
         self.assertEqual(rc, 1, out)
         self.assertIn("MISSING: Python 3.10+", out)
         self.assertIn("sudo apt-get update && sudo apt-get install -y python3 python3-venv python3-pip", out)
         self.assertIn("--install-deps", out)
-        self.assertEqual(self.shim_log(), "", "modo padrao nao pode rodar sudo nem o gerenciador")
+        self.assertEqual(self.shim_log(), "", "default mode must not run sudo or the package manager")
 
     def test_hint_segue_o_gerenciador_detectado(self):
-        """Numa maquina Fedora (dnf, sem apt-get) o hint mostra o comando do dnf,
-        nao o do apt (rev. ponto 2)."""
+        """On a Fedora machine (dnf, no apt-get) the hint shows the dnf command,
+        not the apt one (review point 2)."""
         d = self.shim_bin(pm="dnf")
         rc, out = self.setup(env={"PATH": d})
         self.assertEqual(rc, 1, out)
@@ -601,7 +603,7 @@ class SetupScriptTests(unittest.TestCase):
         self.assertNotIn("apt-get install", out)
 
     def test_install_deps_roda_via_sudo_fora_de_root(self):
-        """--install-deps fora de root: o gerenciador roda via sudo (rev. ponto 6)."""
+        """--install-deps as a non-root user: the package manager runs via sudo (review point 6)."""
         d = self.shim_bin(pm="apt")
         rc, out = self.setup(["--install-deps"], {"PATH": d})
         self.assertEqual(rc, 1, out)   # instala, mas continua sem python -> para com explicacao
@@ -611,8 +613,8 @@ class SetupScriptTests(unittest.TestCase):
         self.assertIn("sudo apt-get install -y python3 python3-venv python3-pip", log)
 
     def test_install_deps_como_root_chama_direto_sem_sudo(self):
-        """--install-deps como root (containers, WSL): o gerenciador roda DIRETO,
-        sem sudo — e' o caso que falhava no Ubuntu 24.04 limpo (rev. ponto 1)."""
+        """--install-deps as root (containers, WSL): the package manager runs DIRECTLY,
+        without sudo — the case that failed on a clean Ubuntu 24.04 (review point 1)."""
         d = self.shim_bin(pm="apt", root=True)
         rc, out = self.setup(["--install-deps"], {"PATH": d})
         self.assertEqual(rc, 1, out)
@@ -622,8 +624,8 @@ class SetupScriptTests(unittest.TestCase):
         self.assertIn("apt-get install -y python3 python3-venv python3-pip", log)
 
     def test_root_sem_sudo_o_hint_nao_tem_prefixo(self):
-        """Como root (id -u = 0) o comando mostrado nao leva sudo: e' o comando que
-        o usuario root deve rodar."""
+        """As root (id -u = 0) the printed command has no sudo prefix: it is the
+        command the root user should run."""
         d = self.shim_bin(pm="apt", root=True)
         rc, out = self.setup(env={"PATH": d})
         self.assertEqual(rc, 1, out)
@@ -636,12 +638,12 @@ class SetupScriptTests(unittest.TestCase):
         fora = tempfile.mkdtemp(prefix="mp-fora-")
         marcador = os.path.join(fora, "marcador.txt")
         with open(marcador, "w", encoding="utf-8") as fh:
-            fh.write("intacto")
+            fh.write("intact")
         rc, out = self.setup(["--no-sudo"], {"VENV_MAIN": fora})
         self.assertEqual(rc, 2, out)
         self.assertIn("unsafe", out)
         self.assertIn("Nothing was removed", out)
-        self.assertTrue(os.path.exists(marcador), "nada pode ser apagado fora do projeto")
+        self.assertTrue(os.path.exists(marcador), "nothing may be deleted outside the project")
         shutil.rmtree(fora, ignore_errors=True)
 
     def test_venv_main_com_dotdot_e_recusado(self):
@@ -673,23 +675,24 @@ class SetupScriptTests(unittest.TestCase):
         python_sem_pip(os.path.join(binp, "python"))
         marcador = os.path.join(self.tree, ".venv", "marcador.txt")
         with open(marcador, "w", encoding="utf-8") as fh:
-            fh.write("intacto")
+            fh.write("intact")
         rc, out = self.setup(["--no-sudo", "--no-kv"])
         self.assertEqual(rc, 2, out)
         self.assertIn("not a venv", out)
-        self.assertTrue(os.path.exists(marcador), "sem pyvenv.cfg nao se remove nada")
+        self.assertTrue(os.path.exists(marcador), "without pyvenv.cfg nothing is removed")
 
     def test_venv_em_subpasta_inexistente_e_aceito(self):
-        """Caminho legitimo dentro do projeto cujo pai ainda nao existe
-        (VENV_MAIN=venvs/kv314): e o caso normal de quem escolhe onde criar o
-        venv, e nao pode ser lido como 'unsafe'."""
+        """A legitimate path inside the project whose parent does not exist yet
+        (VENV_MAIN=venvs/kv314): the normal case of someone choosing where to
+        create the venv, and it must not be read as 'unsafe'."""
         rc, out = self.setup(env={"VENV_MAIN": "venvs/kv314"})
         self.assertNotIn("unsafe", out)
         self.assertNotEqual(rc, 2, out)
 
     def test_pai_symlink_para_fora_nada_e_removido(self):
-        """atalho -> pasta de fora; atalho/.venv e um venv legitimo la fora. O rm -rf
-        seguiria o symlink: a validacao tem de pegar o ancestral, nao so a folha."""
+        """shortcut -> a folder outside; shortcut/.venv is a legitimate venv out there.
+        rm -rf would follow the symlink: the validation must catch the ancestor,
+        not just the leaf."""
         fora = tempfile.mkdtemp(prefix="mp-fora-")
         ext = os.path.join(fora, ".venv")
         os.makedirs(os.path.join(ext, "bin"))
@@ -698,14 +701,14 @@ class SetupScriptTests(unittest.TestCase):
         python_sem_pip(os.path.join(ext, "bin", "python"))
         marcador = os.path.join(ext, "marcador.txt")
         with open(marcador, "w", encoding="utf-8") as fh:
-            fh.write("intacto")
+            fh.write("intact")
         os.symlink(fora, os.path.join(self.tree, "atalho"))
         rc, out = self.setup(["--no-sudo", "--no-kv"], {"VENV_MAIN": "atalho/.venv"})
         self.assertEqual(rc, 2, out)
         self.assertIn("unsafe", out)
         self.assertIn("Nothing was removed", out)
-        self.assertTrue(os.path.isdir(ext), "o venv externo nao pode ser removido")
-        self.assertTrue(os.path.exists(marcador), "o conteudo externo nao pode ser tocado")
+        self.assertTrue(os.path.isdir(ext), "the external venv must not be removed")
+        self.assertTrue(os.path.exists(marcador), "the external content must not be touched")
         shutil.rmtree(fora, ignore_errors=True)
 
     def test_ancestral_symlink_em_caminho_absoluto_tambem_e_recusado(self):
@@ -717,18 +720,18 @@ class SetupScriptTests(unittest.TestCase):
         python_sem_pip(os.path.join(ext, "bin", "python"))
         marcador = os.path.join(ext, "marcador.txt")
         with open(marcador, "w", encoding="utf-8") as fh:
-            fh.write("intacto")
+            fh.write("intact")
         os.symlink(fora, os.path.join(self.tree, "atalho"))
         rc, out = self.setup(["--no-sudo", "--no-kv"],
                              {"VENV_MAIN": os.path.join(self.tree, "atalho", ".venv")})
         self.assertEqual(rc, 2, out)
         self.assertIn("unsafe", out)
-        self.assertTrue(os.path.exists(marcador), "o conteudo externo nao pode ser tocado")
+        self.assertTrue(os.path.exists(marcador), "the external content must not be touched")
         shutil.rmtree(fora, ignore_errors=True)
 
     def test_venv_em_subpasta_do_projeto_continua_aceito(self):
-        """A validacao nao pode restringir alem do que a interface documenta: um
-        VENV_MAIN legitimo em subpasta tem de passar (e o setup segue para o resto)."""
+        """The validation must not restrict beyond what the interface documents: a
+        legitimate VENV_MAIN in a subfolder must pass (and the setup carries on)."""
         os.makedirs(os.path.join(self.tree, "sub"))
         self.real_venv(os.path.join("sub", ".venv"))
         rc, out = self.setup(["--no-sudo", "--no-kv"], {"VENV_MAIN": "sub/.venv"})
@@ -736,8 +739,8 @@ class SetupScriptTests(unittest.TestCase):
         self.assertNotIn("unsafe", out)
         self.assertEqual(rc, 0, out)
     def test_sem_home_definido_o_script_nao_quebra(self):
-        """HOME pode faltar (cron, systemd, env -i). Com `set -u` o script nao pode
-        morrer com 'parameter not set', e nao pode sair com o 2 da rejeicao de seguranca."""
+        """HOME may be missing (cron, systemd, env -i). With `set -u` the script must
+        not die with 'parameter not set', nor exit with the 2 of the safety rejection."""
         env = dict(os.environ)
         env.pop("HOME", None)
         p = subprocess.run(["./setup.sh", "--check"], cwd=self.tree, env=env,
