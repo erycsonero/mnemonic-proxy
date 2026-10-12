@@ -1,12 +1,16 @@
 """Testa setup.sh e run-strata-proxy.sh (a camada de um clique, sem tocar no motor).
 
-Cobre os tres pontos da revisao:
-  1. o fluxo funciona sem Python 3.14: o config criado nasce com kv_archive coerente com
-     o venv escolhido, e um config pessoal que pede kv_archive sem suporte faz o script
-     falhar com mensagem clara sem ser sobrescrito;
+Cobre os pontos da revisao:
+  1. o fluxo funciona sem Python 3.14: o config criado nasce com kv_archive DESLIGADO
+     (opt-in via KV_ARCHIVE=1), e um config pessoal que pede kv_archive sem suporte
+     faz o script falhar com mensagem clara sem ser sobrescrito;
   2. a checagem do motor aceita so 2xx e distingue conexao/timeout de HTTP 4xx/5xx;
   3. nenhum rm -rf em caminho arbitrario: VENV_MAIN / VENV_KV fora do projeto, com "..",
-     symlink, ou pasta que nao e venv, sao recusados antes de qualquer remocao.
+     symlink, ou pasta que nao e venv, sao recusados antes de qualquer remocao;
+  4. privilegios: sem Python o padrao e' mostrar o comando do gerenciador detectado e
+     parar (sem sudo); --install_deps roda — direto como root, via sudo fora de root;
+  5. os testes nao dependem da versao do Python da maquina: os stubs interceptam a
+     sonda `import compression.zstd`, e os venvs reais a escondem via sitecustomize.
 
 Os testes usam venvs reais criados por `python -m venv` (rapido) e um stub de
 `mnemonic-proxy` que nao sobe servidor: o que se testa e a casca, nao o proxy.
@@ -45,28 +49,45 @@ def make_tree():
 
 
 def stub_venv(tree, name, kv=False):
-    """venv com bin/python (real) e bin/mnemonic-proxy (stub que nao sobe servidor).
+    """venv com bin/python e bin/mnemonic-proxy (stub que nao sobe servidor).
 
-    kv=True embrulha o python: `import compression.zstd` passa, o resto e o python real.
+    O python e' um wrapper do real que intercepta APENAS a sonda `import
+    compression.zstd`: kv=True passa, kv=False falha — assim o teste nao depende
+    da versao do Python da maquina (um host 3.14 nao liga o kv "de graca").
     """
     d = os.path.join(tree, name)
     binp = os.path.join(d, "bin")
     os.makedirs(binp, exist_ok=True)
     real = sys.executable
-    if kv:
-        wrap = os.path.join(binp, "python")
-        with open(wrap, "w", encoding="utf-8") as fh:
-            fh.write("#!/bin/sh\n"
-                     "if [ \"$1\" = \"-c\" ]; then case \"$2\" in *compression.zstd*) exit 0;; esac; fi\n"
-                     "exec " + real + " \"$@\"\n")
-        os.chmod(wrap, 0o755)
-    else:
-        os.symlink(real, os.path.join(binp, "python"))
+    verdict = "0" if kv else "1"
+    wrap = os.path.join(binp, "python")
+    with open(wrap, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\n"
+                 "if [ \"$1\" = \"-c\" ]; then case \"$2\" in *compression.zstd*) exit " + verdict + ";; esac; fi\n"
+                 "exec " + real + " \"$@\"\n")
+    os.chmod(wrap, 0o755)
     stub = os.path.join(binp, "mnemonic-proxy")
     with open(stub, "w", encoding="utf-8") as fh:
         fh.write("#!/bin/sh\necho \"[stub mnemonic-proxy] $*\"\n")
     os.chmod(stub, 0o755)
     return name
+
+
+def hide_zstd(venv):
+    """Bloqueia `import compression.zstd` dentro de um venv REAL via sitecustomize.
+
+    O bin/python do venv fica intacto (pip e venv continuam corretos); so a sonda
+    do kv_archive ve um Python pre-3.14, em qualquer maquina.
+    """
+    sp = glob.glob(os.path.join(venv, "lib", "python*", "site-packages"))
+    with open(os.path.join(sp[0], "sitecustomize.py"), "w", encoding="utf-8") as fh:
+        fh.write("import sys\n"
+                 "class _BlockZstd:\n"
+                 "    def find_spec(self, name, path=None, target=None):\n"
+                 "        if name == 'compression.zstd':\n"
+                 "            raise ImportError('blocked by test')\n"
+                 "        return None\n"
+                 "sys.meta_path.insert(0, _BlockZstd())\n")
 
 
 def tmp_abs(tree, name):
@@ -210,7 +231,7 @@ class RunScriptTests(unittest.TestCase):
         self.assertNotIn("sessA", out)
         self.assertNotIn("sessB", out)
         self.assertIn("chars/3.5", out)
-        self.assertIn("non identificato", out)
+        self.assertIn("not identified", out)
         self.assertEqual(self.read_config()["slot_dir"], os.path.join(d, "sessions"))
 
     def test_dois_configs_com_mesmo_model_name_nao_escolhe_nada(self):
@@ -235,7 +256,7 @@ class RunScriptTests(unittest.TestCase):
         self.assertNotIn("--tokenizer", stub[0])
         self.assertNotIn("tokB", out)
         self.assertNotIn("tokC", out)
-        self.assertIn("non identificato", out)
+        self.assertIn("not identified", out)
         self.assertEqual(self.read_config()["slot_dir"], os.path.join(d, "sessions"))
 
     def test_model_do_motor_escolhe_tokenizer_e_slot_do_mesmo_pack(self):
@@ -335,20 +356,57 @@ class RunScriptTests(unittest.TestCase):
         self.assertEqual(cfg["slot_dir"], os.path.join(self.tree, "sessions"))
         self.assertIn("kv_archive=off", out)
 
-    def test_com_suporte_cria_config_com_kv(self):
+    def test_com_suporte_o_config_nasce_com_kv_off_e_avisa_como_ligar(self):
+        """kv_archive e' opt-in (experimental): mesmo com Python 3.14 disponivel o
+        config criado nasce com kv_archive=false, e a saida mostra como ligar."""
         stub_venv(self.tree, ".venv314", kv=True)
         rc, out = self.boot()
+        self.assertEqual(rc, 0, out)
+        self.assertIs(self.read_config()["kv_archive"], False)
+        self.assertIn("kv_archive=off", out)
+        self.assertIn("KV_ARCHIVE=1", out)
+
+    def test_kv_opt_in_com_suporte_cria_config_com_kv(self):
+        stub_venv(self.tree, ".venv314", kv=True)
+        rc, out = self.boot(extra={"KV_ARCHIVE": "1"})
         self.assertEqual(rc, 0, out)
         self.assertIs(self.read_config()["kv_archive"], True)
         self.assertIn("kv_archive=on", out)
 
+    def test_kv_opt_in_sem_suporte_cria_config_sem_kv_e_avisa(self):
+        """KV_ARCHIVE=1 sem Python 3.14: o config nasce sem kv e o motivo e' impresso."""
+        stub_venv(self.tree, ".venv")                        # sonda zstd bloqueada pelo stub
+        rc, out = self.boot(extra={"KV_ARCHIVE": "1"})
+        self.assertEqual(rc, 0, out)
+        self.assertIs(self.read_config()["kv_archive"], False)
+        self.assertIn("KV_ARCHIVE=1 ignored", out)
+        self.assertIn("kv_archive=off", out)
+
     def test_escolhe_o_venv_que_tem_suporte(self):
         stub_venv(self.tree, ".venv")
         stub_venv(self.tree, ".venv314", kv=True)
-        rc, out = self.boot()
+        rc, out = self.boot(extra={"KV_ARCHIVE": "1"})
         self.assertEqual(rc, 0, out)
         self.assertIn("venv=.venv314", out)
         self.assertIn("kv_archive=on", out)
+
+    def test_slot_dir_ausente_avisa_sem_falhar(self):
+        """O slot_dir efetivo e' impresso; se a pasta nao existe, aviso com o mkdir
+        (o saved state nao tem onde escrever), mas o proxy sobe."""
+        stub_venv(self.tree, ".venv")
+        rc, out = self.boot()
+        self.assertEqual(rc, 0, out)
+        slot = os.path.join(self.tree, "sessions")
+        self.assertIn("slot_dir=%s does not exist" % slot, out)
+        self.assertIn('mkdir -p "%s"' % slot, out)
+        self.assertIn("slot_dir=" + slot, out)
+
+    def test_slot_dir_presente_nao_avisa(self):
+        stub_venv(self.tree, ".venv")
+        os.makedirs(os.path.join(self.tree, "sessions"))
+        rc, out = self.boot()
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("does not exist", out)
 
     def test_config_pessoal_com_kv_sem_suporte_falha_sem_tocar_no_config(self):
         stub_venv(self.tree, ".venv")
@@ -357,7 +415,7 @@ class RunScriptTests(unittest.TestCase):
         rc, out = self.boot()
         self.assertNotEqual(rc, 0)
         self.assertIn("compression.zstd", out)
-        self.assertIn("nao foi tocado", out)
+        self.assertIn("was not modified", out)
         self.assertEqual(open(self.cfg, "rb").read(), antes, "config pessoal nao pode ser alterado")
         self.assertEqual(self.read_config()["slot_dir"], "/meu/slot")
 
@@ -382,7 +440,7 @@ class RunScriptTests(unittest.TestCase):
             fh.write("{ isto nao e json")
         rc, out = self.boot()
         self.assertNotEqual(rc, 0)
-        self.assertIn("JSON invalido", out)
+        self.assertIn("invalid JSON", out)
 
     def test_http_503_do_motor_e_erro(self):
         stub_venv(self.tree, ".venv")
@@ -400,13 +458,13 @@ class RunScriptTests(unittest.TestCase):
         stub_venv(self.tree, ".venv")
         rc, out = self.boot(extra={"STRATA_URL": "http://127.0.0.1:1"})
         self.assertNotEqual(rc, 0)
-        self.assertIn("conexao", out)
+        self.assertIn("connection", out)
 
     def test_timeout_e_erro(self):
         stub_venv(self.tree, ".venv")
         rc, out = self.boot(sleep=3.0, extra={"PROBE_TIMEOUT": "1"})
         self.assertNotEqual(rc, 0)
-        self.assertIn("conexao", out)
+        self.assertIn("connection", out)
 
     def test_timeout_invalido_sem_curl_nao_inventa_http(self):
         """Senza curl il probe cade sul python: un PROBE_TIMEOUT non numerico non deve
@@ -419,8 +477,8 @@ class RunScriptTests(unittest.TestCase):
         rc, out = self.boot(extra={"STRATA_URL": "http://127.0.0.1:1",
                                    "PROBE_TIMEOUT": "abc", "PATH": nobin})
         self.assertNotEqual(rc, 0, out)
-        self.assertIn("conexao", out)
-        self.assertNotIn("respondeu HTTP", out)
+        self.assertIn("connection", out)
+        self.assertNotIn("answered HTTP", out)
 
     def test_sem_venv_nao_sobe(self):
         rc, out = self.boot()
@@ -467,7 +525,8 @@ class SetupScriptTests(unittest.TestCase):
                 self.assertEqual(rc, 0, "%s -n %s: %s" % (shell, name, out))
 
     def test_check_passa_sem_python_314(self):
-        self.real_venv(".venv")
+        venv = self.real_venv(".venv")
+        hide_zstd(venv)          # independente do Python da maquina (rev. ponto 5)
         rc, out = self.setup(["--check"])
         self.assertEqual(rc, 0, out)
         self.assertIn("kv_archive (zstd)", out)
@@ -476,15 +535,102 @@ class SetupScriptTests(unittest.TestCase):
     def test_check_falha_sem_venv(self):
         rc, out = self.setup(["--check"])
         self.assertEqual(rc, 1, out)
-        self.assertIn("FALTA", out)
+        self.assertIn("MISSING", out)
 
     def test_no_kv_nao_tenta_uv_e_sai_zero(self):
-        self.real_venv(".venv")
+        venv = self.real_venv(".venv")
+        hide_zstd(venv)
         rc, out = self.setup(["--no-sudo", "--no-kv"])
         self.assertEqual(rc, 0, out)
         self.assertIn("kv_archive (zstd)", out)
         self.assertIn(": no", out)
-        self.assertNotIn("criando .venv314", out)
+        self.assertNotIn("creating %s" % os.path.join(self.tree, ".venv314"), out)
+        self.assertNotIn("building .venv314", out)
+    # ---- privilegios (rev. pontos 1, 2 e 6) ---------------------------------
+    # Um PATH minimo, SEM python: os coreutils que o setup.sh usa antes da etapa do
+    # Python (dirname, id), stubs com log para o gerenciador de pacotes e para o
+    # sudo. Assim se prova O QUE seria rodado, sem instalar nada de verdade.
+    def shim_bin(self, pm="apt", root=False):
+        d = os.path.join(self.tree, "shimbin")
+        os.makedirs(d, exist_ok=True)
+        self.shimlog = os.path.join(self.tree, "shim.log")
+        for tool in ("dirname",):
+            src = shutil.which(tool)
+            os.symlink(src, os.path.join(d, tool))
+        if root:
+            real_id = shutil.which("id")
+            with open(os.path.join(d, "id"), "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\n"
+                         "if [ \"$1\" = \"-u\" ]; then echo 0; else exec %s \"$@\"; fi\n" % real_id)
+                os.chmod(os.path.join(d, "id"), 0o755)
+        else:
+            os.symlink(shutil.which("id"), os.path.join(d, "id"))
+        pm_bin = {"apt": "apt-get", "dnf": "dnf", "pacman": "pacman", "zypper": "zypper"}[pm]
+        with open(os.path.join(d, pm_bin), "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\necho \"%s $*\" >> \"%s\"\n" % (pm_bin, self.shimlog))
+            os.chmod(os.path.join(d, pm_bin), 0o755)
+        with open(os.path.join(d, "sudo"), "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\necho \"sudo $*\" >> \"%s\"\nexec \"$@\"\n" % self.shimlog)
+            os.chmod(os.path.join(d, "sudo"), 0o755)
+        return d
+
+    def shim_log(self):
+        if not os.path.exists(self.shimlog):
+            return ""
+        with open(self.shimlog, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_sem_python_o_padrao_e_mostrar_o_comando_e_parar(self):
+        """Sem Python e sem --install-deps: o script imprime o comando do gerenciador
+        detectado e sai 1 — sem chamar sudo nem o gerenciador (rev. ponto 6)."""
+        d = self.shim_bin(pm="apt")
+        rc, out = self.setup(env={"PATH": d})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("MISSING: Python 3.10+", out)
+        self.assertIn("sudo apt-get update && sudo apt-get install -y python3 python3-venv python3-pip", out)
+        self.assertIn("--install-deps", out)
+        self.assertEqual(self.shim_log(), "", "modo padrao nao pode rodar sudo nem o gerenciador")
+
+    def test_hint_segue_o_gerenciador_detectado(self):
+        """Numa maquina Fedora (dnf, sem apt-get) o hint mostra o comando do dnf,
+        nao o do apt (rev. ponto 2)."""
+        d = self.shim_bin(pm="dnf")
+        rc, out = self.setup(env={"PATH": d})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("sudo dnf install -y python3 python3-pip", out)
+        self.assertNotIn("apt-get install", out)
+
+    def test_install_deps_roda_via_sudo_fora_de_root(self):
+        """--install-deps fora de root: o gerenciador roda via sudo (rev. ponto 6)."""
+        d = self.shim_bin(pm="apt")
+        rc, out = self.setup(["--install-deps"], {"PATH": d})
+        self.assertEqual(rc, 1, out)   # instala, mas continua sem python -> para com explicacao
+        self.assertIn("still no Python 3.10+", out)
+        log = self.shim_log()
+        self.assertIn("sudo apt-get update", log)
+        self.assertIn("sudo apt-get install -y python3 python3-venv python3-pip", log)
+
+    def test_install_deps_como_root_chama_direto_sem_sudo(self):
+        """--install-deps como root (containers, WSL): o gerenciador roda DIRETO,
+        sem sudo — e' o caso que falhava no Ubuntu 24.04 limpo (rev. ponto 1)."""
+        d = self.shim_bin(pm="apt", root=True)
+        rc, out = self.setup(["--install-deps"], {"PATH": d})
+        self.assertEqual(rc, 1, out)
+        log = self.shim_log()
+        self.assertNotIn("sudo", log)
+        self.assertIn("apt-get update", log)
+        self.assertIn("apt-get install -y python3 python3-venv python3-pip", log)
+
+    def test_root_sem_sudo_o_hint_nao_tem_prefixo(self):
+        """Como root (id -u = 0) o comando mostrado nao leva sudo: e' o comando que
+        o usuario root deve rodar."""
+        d = self.shim_bin(pm="apt", root=True)
+        rc, out = self.setup(env={"PATH": d})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("  apt-get update && apt-get install -y python3 python3-venv python3-pip", out)
+        self.assertNotIn("sudo apt-get", out)
+
+
 
     def test_venv_main_fora_do_projeto_nada_e_removido(self):
         fora = tempfile.mkdtemp(prefix="mp-fora-")
@@ -493,25 +639,25 @@ class SetupScriptTests(unittest.TestCase):
             fh.write("intacto")
         rc, out = self.setup(["--no-sudo"], {"VENV_MAIN": fora})
         self.assertEqual(rc, 2, out)
-        self.assertIn("inseguro", out)
-        self.assertIn("Nada foi removido", out)
+        self.assertIn("unsafe", out)
+        self.assertIn("Nothing was removed", out)
         self.assertTrue(os.path.exists(marcador), "nada pode ser apagado fora do projeto")
         shutil.rmtree(fora, ignore_errors=True)
 
     def test_venv_main_com_dotdot_e_recusado(self):
         rc, out = self.setup(["--no-sudo"], {"VENV_MAIN": "../fora"})
         self.assertEqual(rc, 2, out)
-        self.assertIn("inseguro", out)
+        self.assertIn("unsafe", out)
 
     def test_venv_main_raiz_do_projeto_e_recusada(self):
         rc, out = self.setup(["--no-sudo"], {"VENV_MAIN": "."})
         self.assertEqual(rc, 2, out)
-        self.assertIn("inseguro", out)
+        self.assertIn("unsafe", out)
 
     def test_venv_kv_caminho_da_home_e_recusado(self):
         rc, out = self.setup(["--no-sudo"], {"HOME": self.tree, "VENV_KV": self.tree + "/.venv314"})
         self.assertEqual(rc, 2, out)
-        self.assertIn("inseguro", out)
+        self.assertIn("unsafe", out)
 
     def test_venv_main_symlink_e_recusado(self):
         alvo = os.path.join(self.tree, "alvo")
@@ -519,7 +665,7 @@ class SetupScriptTests(unittest.TestCase):
         os.symlink(alvo, os.path.join(self.tree, ".venv"))
         rc, out = self.setup(["--no-sudo"], {"VENV_MAIN": ".venv"})
         self.assertEqual(rc, 2, out)
-        self.assertIn("inseguro", out)
+        self.assertIn("unsafe", out)
 
     def test_nao_remove_pasta_que_nao_e_venv(self):
         binp = os.path.join(self.tree, ".venv", "bin")
@@ -530,15 +676,15 @@ class SetupScriptTests(unittest.TestCase):
             fh.write("intacto")
         rc, out = self.setup(["--no-sudo", "--no-kv"])
         self.assertEqual(rc, 2, out)
-        self.assertIn("nao e um venv", out)
+        self.assertIn("not a venv", out)
         self.assertTrue(os.path.exists(marcador), "sem pyvenv.cfg nao se remove nada")
 
     def test_venv_em_subpasta_inexistente_e_aceito(self):
         """Caminho legitimo dentro do projeto cujo pai ainda nao existe
         (VENV_MAIN=venvs/kv314): e o caso normal de quem escolhe onde criar o
-        venv, e nao pode ser lido como 'inseguro'."""
+        venv, e nao pode ser lido como 'unsafe'."""
         rc, out = self.setup(env={"VENV_MAIN": "venvs/kv314"})
-        self.assertNotIn("inseguro", out)
+        self.assertNotIn("unsafe", out)
         self.assertNotEqual(rc, 2, out)
 
     def test_pai_symlink_para_fora_nada_e_removido(self):
@@ -556,8 +702,8 @@ class SetupScriptTests(unittest.TestCase):
         os.symlink(fora, os.path.join(self.tree, "atalho"))
         rc, out = self.setup(["--no-sudo", "--no-kv"], {"VENV_MAIN": "atalho/.venv"})
         self.assertEqual(rc, 2, out)
-        self.assertIn("inseguro", out)
-        self.assertIn("Nada foi removido", out)
+        self.assertIn("unsafe", out)
+        self.assertIn("Nothing was removed", out)
         self.assertTrue(os.path.isdir(ext), "o venv externo nao pode ser removido")
         self.assertTrue(os.path.exists(marcador), "o conteudo externo nao pode ser tocado")
         shutil.rmtree(fora, ignore_errors=True)
@@ -576,7 +722,7 @@ class SetupScriptTests(unittest.TestCase):
         rc, out = self.setup(["--no-sudo", "--no-kv"],
                              {"VENV_MAIN": os.path.join(self.tree, "atalho", ".venv")})
         self.assertEqual(rc, 2, out)
-        self.assertIn("inseguro", out)
+        self.assertIn("unsafe", out)
         self.assertTrue(os.path.exists(marcador), "o conteudo externo nao pode ser tocado")
         shutil.rmtree(fora, ignore_errors=True)
 
@@ -587,7 +733,7 @@ class SetupScriptTests(unittest.TestCase):
         self.real_venv(os.path.join("sub", ".venv"))
         rc, out = self.setup(["--no-sudo", "--no-kv"], {"VENV_MAIN": "sub/.venv"})
         self.assertNotEqual(rc, 2, out)
-        self.assertNotIn("inseguro", out)
+        self.assertNotIn("unsafe", out)
         self.assertEqual(rc, 0, out)
     def test_sem_home_definido_o_script_nao_quebra(self):
         """HOME pode faltar (cron, systemd, env -i). Com `set -u` o script nao pode
@@ -599,4 +745,4 @@ class SetupScriptTests(unittest.TestCase):
         out = p.stdout + p.stderr
         self.assertNotIn("parameter not set", out)
         self.assertNotEqual(p.returncode, 2, out)
-        self.assertIn("FALTA", out)
+        self.assertIn("MISSING", out)
