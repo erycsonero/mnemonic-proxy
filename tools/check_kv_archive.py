@@ -1,33 +1,38 @@
 #!/usr/bin/env python3
-# Author: Maurizio Verde — LastReload (conferenza dell'archivio freddo)
-"""Conferma che il `kv_archive` sta lavorando e quanto fa risparmiare.
+"""Confirm that `kv_archive` is working, and how much it saves.
 
-Sole LETTURE: non archivia, non cancella, non tocca il motore.
+STRICTLY READ-ONLY: it does not archive, does not delete, does not touch the engine,
+and never creates the archive directories. Opening a missing archive is reported, not
+materialised.
 
-Fotografa tre cose e le mette a confronto:
+It takes a snapshot of three things and compares them:
 
-  sessions/     i .bin dello stato salvato (bytes, eta del file)
-  kv-archive/   blocks/*.kvb + manifests/*.kva (usage, blocchi condivisi per deduplica)
-  condizioni    cosa chiede l'archiviatore (ctxproxy/core.py) e quanto manca perche' scatti
+  sessions/     the saved-state .bin files (bytes, file age)
+  kv-archive/   blocks/*.kvb + manifests/*.kva (usage, blocks shared by dedup)
+  conditions    what the archiver asks for (ctxproxy/core.py) and how far it is from firing
 
-Le condizioni per archiviare sono TUTTE e tre insieme:
+The conditions to archive are ALL three together:
 
-  motore fermo da >= kv_archive_idle_s      (default 600 s = 10 min)
-  file di stato fermo da >= kv_archive_min_age_s (default 1800 s = 30 min)
-  file di stato >= kv_archive_min_bytes     (default 64 MiB)
+  engine idle for >= kv_archive_idle_s        (default 600 s = 10 min)
+  state file idle for >= kv_archive_min_age_s (default 1800 s = 30 min)
+  state file >= kv_archive_min_bytes          (default 64 MiB)
 
-e l'archiviatore si sveglia ogni kv_archive_poll_s (default 60 s).
+and the archiver wakes every kv_archive_poll_s (default 60 s).
 
-Il contatore di fermata del motore si AZZERA a ogni richiesta: una conversazione in corso
-(il cliente che chiama strumenti) impedisce l'archiviazione. E' il motivo per cui la
-conferenza si fa a motore lasciato stare.
+The engine's idle counter RESETS on every request: a conversation in progress
+(the client calling tools) prevents archiving. That is why the check is done with
+the engine left alone.
 
-Uso:
-    .venv314/bin/python tools/check_kv_archive.py              # fotografia adesso
-    .venv314/bin/python tools/check_kv_archive.py --watch      # segue finche' archivia
+Exit code: 0 when everything is fine, 1 when a problem is found (a corrupt archive,
+a failed restore, or --watch that never saw an archive), 2 on a usage/config error.
+That makes it usable in scripts.
+
+Usage:
+    .venv314/bin/python tools/check_kv_archive.py              # snapshot now
+    .venv314/bin/python tools/check_kv_archive.py --watch      # follow until it archives
     .venv314/bin/python tools/check_kv_archive.py --restore-check
-                                                              # prova che il restore ricostruisce
-                                                                un .bin byte-identico (sha256)
+                                                              # prove the restore rebuilds
+                                                                a byte-identical .bin (sha256)
 """
 from __future__ import annotations
 
@@ -35,7 +40,9 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 import types
 import urllib.request
@@ -68,7 +75,7 @@ def read_json(path):
 
 
 def engine_status(upstream, timeout=8.0):
-    """/v1/status del motore: requests, in_flight, started. None se non risponde."""
+    """/v1/status of the engine: requests, in_flight, started. None if it does not answer."""
     try:
         with urllib.request.urlopen(upstream.rstrip("/") + "/v1/status", timeout=timeout) as r:
             st = json.loads(r.read().decode())
@@ -95,7 +102,10 @@ def snapshot_sessions(slot_dir):
 
 
 def snapshot_archive(arc):
-    """usage() della libreria + blocchi condivisi fra manifest (deduplica)."""
+    """usage() from the library + blocks shared between manifests (dedup).
+
+Read-only: a KvArchive is opened only when the root exists, because building one
+would create root/blocks and root/manifests as a side effect."""
     if not os.path.isdir(arc.root):
         return {"root": arc.root, "exists": False}
     u = arc.usage()
@@ -125,34 +135,43 @@ def verify_all(arc, names=None):
     return out
 
 
-def restore_check(arc, dest_dir):
-    """Prova il restore: ricostruisce ogni archivio e confronta sha256 con il manifest."""
+def restore_check(arc, dest_dir=None):
+    """Prove the restore: rebuild every archive and compare the sha256 with the manifest.
+
+    Restores into a private temp dir (tempfile.mkdtemp) unless one is given, and
+    removes it at the end: the audit never writes to a fixed path under /tmp."""
+    own_dir = dest_dir is None
+    if own_dir:
+        dest_dir = tempfile.mkdtemp(prefix="kva-restore-check-")
     out = []
-    os.makedirs(dest_dir, exist_ok=True)
-    for n in arc.names():
-        m = arc.manifest(n)
-        dest = os.path.join(dest_dir, n + ".bin")
-        try:
-            r = arc.restore(n, dest)
-            sha = hashlib.sha256()
-            with open(dest, "rb") as f:
-                for chunk in iter(lambda: f.read(1 << 22), b""):
-                    sha.update(chunk)
-            out.append({"name": n, "bytes": r["bytes"], "ms": r["ms"],
-                        "sha256_ok": sha.hexdigest() == m["sha256"],
-                        "sha256": m["sha256"][:16]})
-        except Exception as e:
-            out.append({"name": n, "error": str(e)[:200]})
-        finally:
+    try:
+        for n in arc.names():
+            m = arc.manifest(n)
+            dest = os.path.join(dest_dir, n + ".bin")
             try:
-                os.remove(dest)
-            except OSError:
-                pass
+                r = arc.restore(n, dest)
+                sha = hashlib.sha256()
+                with open(dest, "rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 22), b""):
+                        sha.update(chunk)
+                out.append({"name": n, "bytes": r["bytes"], "ms": r["ms"],
+                            "sha256_ok": sha.hexdigest() == m["sha256"],
+                            "sha256": m["sha256"][:16]})
+            except Exception as e:
+                out.append({"name": n, "error": str(e)[:200]})
+            finally:
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
+    finally:
+        if own_dir:
+            shutil.rmtree(dest_dir, ignore_errors=True)
     return out
 
 
 def conditions(cfg, sessions, eng, idle_seen_s):
-    """Cosa chiede l'archiviatore e quanto manca. idle_seen_s: secondi di motore fermo osservati."""
+    """What the archiver asks for and how far it is. idle_seen_s: seconds of engine idle observed."""
     need_idle = float(getattr(cfg, "kv_archive_idle_s", 600.0))
     need_age = float(getattr(cfg, "kv_archive_min_age_s", 1800.0))
     need_bytes = int(getattr(cfg, "kv_archive_min_bytes", 64 * 2 ** 20))
@@ -173,59 +192,69 @@ def conditions(cfg, sessions, eng, idle_seen_s):
 def report(sessions, arch, rows, need, eng, idle_seen_s, arc):
     print("== sessions/ (%s) ==" % hhmm(time.time()))
     if not sessions:
-        print("  nessun .bin: lo stato salvato non c'e' (autosave non ha ancora salvato)")
+        print("  no .bin: there is no saved state (autosave has not saved yet)")
     tot = 0
     for s in sessions:
         tot += s["bytes"]
-        print("  %-46s %12s  eta %5ss" % (s["name"], human(s["bytes"]), s["age_s"]))
-    print("  totale %s in %d file" % (human(tot), len(sessions)))
+        print("  %-46s %12s  age %5ss" % (s["name"], human(s["bytes"]), s["age_s"]))
+    print("  total %s in %d files" % (human(tot), len(sessions)))
 
     print("\n== kv-archive/ (%s) ==" % arch["root"])
     if not arch.get("exists"):
-        print("  la cartella non esiste ancora: l'archiviatore non ha mai archiviato")
+        print("  the folder does not exist yet: the archiver has never archived")
     elif arch["manifests"] == 0:
-        print("  vuota: %d blocchi, nessun manifest - l'archiviatore non ha ancora archiviato nulla"
+        print("  empty: %d blocks, no manifest - the archiver has not archived anything yet"
               % arch["blocks"])
     else:
-        print("  manifest %d, blocchi %d" % (arch["manifests"], arch["blocks"]))
-        print("  logico %s  archiviato %s  ratio %s"
+        print("  manifests %d, blocks %d" % (arch["manifests"], arch["blocks"]))
+        print("  logical %s  stored %s  ratio %s"
               % (human(arch["logical_bytes"]), human(arch["stored_bytes"]),
                  ("%.1f%%" % (arch["ratio"] * 100)) if arch["ratio"] else "-"))
         if arch["logical_bytes"]:
             saved = arch["logical_bytes"] - arch["stored_bytes"]
-            print("  risparmio %s (%.1f%%)" % (human(saved), 100.0 * saved / arch["logical_bytes"]))
-        print("  blocchi condivisi per deduplica: %d (%s gia pagati una sola volta, %d riutilizzi)"
+            print("  saved %s (%.1f%%)" % (human(saved), 100.0 * saved / arch["logical_bytes"]))
+        print("  blocks shared by dedup: %d (%s paid only once, %d reuses)"
               % (arch["shared_blocks"], human(arch["shared_stored_bytes"]), arch["reuses"]))
         for n in arch["names"]:
             print("    %s" % n)
 
-    print("\n== perche' non archivia (condizioni di ctxproxy/core.py) ==")
-    print("  motore fermo >= %ss, file fermo >= %ss, file >= %s, risveglio ogni %ss"
+    print("\n== why it is not archiving (conditions in ctxproxy/core.py) ==")
+    print("  engine idle >= %ss, file idle >= %ss, file >= %s, wakes every %ss"
           % (int(need["idle_s"]), int(need["min_age_s"]), human(need["min_bytes"]), int(need["poll_s"])))
-    print("  motore: requests=%s in_flight=%s; fermo osservato da %ss"
+    print("  engine: requests=%s in_flight=%s; idle observed for %ss"
           % (eng.get("requests"), eng.get("in_flight"), int(idle_seen_s or 0)))
     if eng.get("error"):
-        print("  motore non raggiungibile: %s" % eng["error"])
+        print("  engine unreachable: %s" % eng["error"])
     for r in rows:
         print("  %-46s size_ok=%s age_ok=%s engine_ok=%s -> %s"
               % (r["name"], r["size_ok"], r["age_ok"], r["engine_ok"],
-                 "PRONTO" if r["ready"] else "manca eta %ss, motore %ss"
+                 "READY" if r["ready"] else "missing age %ss, engine %ss"
                  % (r["eta_age_s"], r["eta_idle_s"])))
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="conferenza dell'archivio freddo kv_archive")
+def open_archive(root):
+    """Open a KvArchive only when the root exists; otherwise return None.
+
+    KvArchive.__init__ creates root/blocks and root/manifests, so building one for a
+    missing root would write to disk: the audit stays read-only by never doing it."""
+    if not root or not os.path.isdir(root):
+        return None
+    return KvArchive(root)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="check of the cold kv_archive store")
     ap.add_argument("--config", default=os.path.join(ROOT, "config.json"))
-    ap.add_argument("--slot-dir", default="", help="default: dal config.json")
-    ap.add_argument("--root", default="", help="default: <padre di slot_dir>/kv-archive")
+    ap.add_argument("--slot-dir", default="", help="default: from config.json")
+    ap.add_argument("--root", default="", help="default: <parent of slot_dir>/kv-archive")
     ap.add_argument("--upstream", default="http://127.0.0.1:8080")
-    ap.add_argument("--watch", action="store_true", help="segue finche' appare un manifest")
-    ap.add_argument("--interval", type=float, default=60.0, help="poll del --watch (default 60 s)")
-    ap.add_argument("--duration", type=float, default=3600.0, help="max secondi del --watch (default 3600)")
+    ap.add_argument("--watch", action="store_true", help="follow until a manifest appears")
+    ap.add_argument("--interval", type=float, default=60.0, help="--watch poll (default 60 s)")
+    ap.add_argument("--duration", type=float, default=3600.0, help="max --watch seconds (default 3600)")
     ap.add_argument("--restore-check", action="store_true",
-                    help="ricostruisce ogni archivio e confronta sha256 (scrive in /tmp)")
-    ap.add_argument("--json", action="store_true", help="stampa anche il JSON riassuntivo")
-    a = ap.parse_args()
+                    help="rebuild every archive and compare sha256 (private temp dir)")
+    ap.add_argument("--json", action="store_true", help="also print the summary JSON")
+    a = ap.parse_args(argv)
 
     raw = read_json(a.config) if os.path.exists(a.config) else {}
     slot_dir = a.slot_dir or raw.get("slot_dir", "")
@@ -239,30 +268,50 @@ def main() -> int:
         kv_archive_poll_s=raw.get("kv_archive_poll_s", 60.0))
     root = a.root or default_root(cfg)
     if not slot_dir:
-        print("FALTA slot_dir (config.json senza slot_dir e senza --slot-dir): niente archivio")
+        print("MISSING slot_dir (config.json without slot_dir and no --slot-dir): no archive")
         return 2
     print("config %s | kv_archive=%s | slot_dir=%s | root=%s" % (a.config, cfg.kv_archive, slot_dir, root))
     if not cfg.kv_archive:
-        print("NOTA: nel config kv_archive e' spento. L'archiviatore non gira: la conferenza e' solo lo stato.")
+        print("NOTE: kv_archive is off in the config. The archiver is not running: this is just the state.")
 
-    arc = KvArchive(root)
+    arc = open_archive(root)
     eng0 = engine_status(a.upstream)
     sessions = snapshot_sessions(slot_dir)
-    arch = snapshot_archive(arc)
+    arch = snapshot_archive(arc) if arc else {"root": root, "exists": False}
     rows, need = conditions(cfg, sessions, eng0, 0.0)
     report(sessions, arch, rows, need, eng0, 0.0, arc)
 
+    # verify_all is part of the audit (not only of --restore-check): a corrupt block
+    # must be reported and must make the exit code non-zero.
+    checks = verify_all(arc) if arc else []
+    bad = [r for r in checks if not r.get("ok")]
+    print("\n== verify (block hashes + size, %d archives) ==" % len(checks))
+    if not arc:
+        print("  skipped: the archive folder does not exist")
+    elif not checks:
+        print("  no manifest to verify")
+    else:
+        for r in checks:
+            print("  %-46s %s%s" % (r["name"], "ok" if r.get("ok") else "CORRUPT",
+                                    "" if r.get("ok") else " (%s)" % r.get("error", "hash mismatch")))
+    if bad:
+        print("  %d corrupt archive(s): the audit failed" % len(bad))
+
     if not a.watch:
+        restore_bad = []
         if a.restore_check:
-            print("\n== restore-check (ricostruzione + sha256) ==")
-            for r in restore_check(arc, "/tmp/kva-restore-check"):
+            print("\n== restore-check (rebuild + sha256) ==")
+            for r in restore_check(arc):
                 print("  ", json.dumps(r, ensure_ascii=False))
+                if r.get("error") or not r.get("sha256_ok"):
+                    restore_bad.append(r)
         if a.json:
             print("\n" + json.dumps({"sessions": sessions, "archive": arch, "conditions": rows,
-                                     "need": need}, ensure_ascii=False, indent=2))
-        return 0
+                                     "need": need, "verify": checks, "restore": restore_bad},
+                                    ensure_ascii=False, indent=2))
+        return 1 if (bad or restore_bad) else 0
 
-    print("\n--watch: motore fermo da %ss; un solo uso del motore azzera il conteggio\n"
+    print("\n--watch: engine idle for %ss; a single use of the engine resets the count\n"
           % int(0))
     last_req, idle_since = eng0.get("requests"), time.time()
     seen = set(arch["names"]) if arch.get("exists") else set()
@@ -275,25 +324,26 @@ def main() -> int:
             last_req, idle_since = eng.get("requests"), now
         idle_seen = now - idle_since
         sessions = snapshot_sessions(slot_dir)
-        arch = snapshot_archive(arc)
+        arc = open_archive(root)
+        arch = snapshot_archive(arc) if arc else {"root": root, "exists": False}
         rows, need = conditions(cfg, sessions, eng, idle_seen)
         new = [n for n in arch["names"] if n not in seen]
         if new:
-            print("== %s: ARCHIVIATO %s ==" % (hhmm(now), ", ".join(new)))
+            print("== %s: ARCHIVED %s ==" % (hhmm(now), ", ".join(new)))
             report(sessions, arch, rows, need, eng, idle_seen, arc)
             if a.restore_check:
-                print("\n== restore-check (ricostruzione + sha256) ==")
-                for r in restore_check(arc, "/tmp/kva-restore-check"):
+                print("\n== restore-check (rebuild + sha256) ==")
+                for r in restore_check(arc):
                     print("  ", json.dumps(r, ensure_ascii=False))
             if a.json:
                 print(json.dumps({"sessions": sessions, "archive": arch}, ensure_ascii=False, indent=2))
             return 0
         ready = [r for r in rows if r["ready"]]
-        print("%s  motore fermo %3.0fs  in_flight=%s  manifest=%d  %s"
+        print("%s  engine idle %3.0fs  in_flight=%s  manifests=%d  %s"
               % (hhmm(now), idle_seen, eng.get("in_flight"), arch["manifests"],
-                 ("PRONTI: " + ", ".join(r["name"] for r in ready)) if ready else
-                 "mancano eta/motore"))
-    print("--watch terminato senza archiviazione (motore mai rimasto fermo abbastanza)")
+                 ("READY: " + ", ".join(r["name"] for r in ready)) if ready else
+                 "missing age/engine"))
+    print("--watch ended without archiving (the engine was never idle long enough)")
     return 1
 
 
