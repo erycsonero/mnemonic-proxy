@@ -74,6 +74,69 @@ def stub_venv(tree, name, kv=False):
     return name
 
 
+def snapshot_tree(root):
+    """Snapshot every path under `root` with size and mtime: two equal snapshots
+    prove that a run created, removed or modified nothing (--check is read-only).
+
+    Byte-compiled caches (__pycache__, *.pyc) are skipped: importing Python code
+    during the run rewrites them, and they are not part of what --check must keep
+    untouched (the venv, the config, the project files)."""
+    snap = {}
+    for base, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+        for name in sorted(dirs):
+            # directories: only their existence matters (their size/mtime change
+            # whenever any child is written, which is not what --check must preserve)
+            snap[os.path.relpath(os.path.join(base, name), root)] = ("dir",)
+        for name in sorted(files):
+            if name.endswith((".pyc", ".pyo")):
+                continue
+            p = os.path.join(base, name)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            snap[os.path.relpath(p, root)] = (st.st_size, st.st_mtime_ns, st.st_mode)
+    return snap
+
+
+def stub_packet(venv):
+    """Make a REAL venv look installed for setup.sh: bin/mnemonic-proxy + an
+    importable ctxproxy package in site-packages. Used by the --check tests that
+    need a *complete* environment, without running pip."""
+    binp = os.path.join(venv, "bin")
+    with open(os.path.join(binp, "mnemonic-proxy"), "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\nprintf 'stub\\n'\n")
+    os.chmod(os.path.join(binp, "mnemonic-proxy"), 0o755)
+    sp = glob.glob(os.path.join(venv, "lib", "python*", "site-packages"))
+    if sp:
+        site = sp[0]
+    else:                              # a stub venv has no lib/: create one
+        site = os.path.join(venv, "lib", "python%d.%d" % sys.version_info[:2], "site-packages")
+        os.makedirs(site, exist_ok=True)
+    pkg = os.path.join(site, "ctxproxy")
+    os.makedirs(pkg, exist_ok=True)
+    with open(os.path.join(pkg, "__init__.py"), "w", encoding="utf-8") as fh:
+        fh.write("# stub package for the setup tests\n")
+    return venv
+
+
+def show_zstd(venv):
+    """Make `import compression.zstd` succeed inside a REAL venv via sitecustomize,
+    on any host Python. The venv's python stays untouched, so pip, venv creation
+    and the package probes keep working: only the kv_archive probe is faked."""
+    sp = glob.glob(os.path.join(venv, "lib", "python*", "site-packages"))[0]
+    with open(os.path.join(sp, "sitecustomize.py"), "w", encoding="utf-8") as fh:
+        fh.write("import sys, types\n"
+                 "if 'compression.zstd' not in sys.modules:\n"
+                 "    pkg = types.ModuleType('compression')\n"
+                 "    pkg.__path__ = []\n"
+                 "    mod = types.ModuleType('compression.zstd')\n"
+                 "    pkg.zstd = mod\n"
+                 "    sys.modules['compression'] = pkg\n"
+                 "    sys.modules['compression.zstd'] = mod\n")
+
+
 def hide_zstd(venv):
     """Block `import compression.zstd` inside a REAL venv via sitecustomize.
 
@@ -526,7 +589,10 @@ class SetupScriptTests(unittest.TestCase):
                 self.assertEqual(rc, 0, "%s -n %s: %s" % (shell, name, out))
 
     def test_check_passa_sem_python_314(self):
+        """A valid environment (venv + installed package) passes --check with exit 0,
+        even without Python 3.14: the missing kv_archive is opt-in, not a failure."""
         venv = self.real_venv(".venv")
+        stub_packet(venv)        # make bin/mnemonic-proxy + the importable package
         hide_zstd(venv)          # independent of the host Python (review point 5)
         rc, out = self.setup(["--check"])
         self.assertEqual(rc, 0, out)
@@ -538,6 +604,75 @@ class SetupScriptTests(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("MISSING", out)
 
+# ---- --check is read-only (no removal, no creation, no install) ----------
+    def test_check_nao_remove_venv_incompleto(self):
+        """A venv whose python has no pip (interrupted creation): --check reports it
+        and exits non-zero, leaving the directory exactly as it was — no rm -rf, no
+        recreation (that is what a plain ./setup.sh does)."""
+        binp = os.path.join(self.tree, ".venv", "bin")
+        os.makedirs(binp)
+        with open(os.path.join(self.tree, ".venv", "pyvenv.cfg"), "w", encoding="utf-8") as fh:
+            fh.write("home = /usr/bin\n")
+        marker = os.path.join(self.tree, ".venv", "marker.txt")
+        with open(marker, "w", encoding="utf-8") as fh:
+            fh.write("untouched")
+        python_sem_pip(os.path.join(binp, "python"))
+
+        rc, out = self.setup(["--check"])
+
+        self.assertEqual(rc, 1, out)
+        self.assertIn("incomplete", out)
+        self.assertTrue(os.path.isdir(os.path.join(self.tree, ".venv")),
+                        "--check must not remove the venv")
+        self.assertTrue(os.path.exists(marker), "--check must not touch the venv contents")
+        self.assertTrue(os.path.exists(os.path.join(binp, "python")),
+                        "--check must not recreate the venv")
+
+    def test_check_nao_instala_pacote_ausente(self):
+        """A venv with a working python+pip but without the package: --check reports
+        the missing package, exits non-zero and installs nothing — no setup/egg-info
+        is created, so the environment is untouched."""
+        venv = self.real_venv(".venv", with_bin=False)   # no mnemonic-proxy stub on purpose
+
+        rc, out = self.setup(["--check"])
+
+        self.assertEqual(rc, 1, out)
+        self.assertIn("package is not installed", out)
+        self.assertFalse(glob.glob(os.path.join(venv, "lib", "python*", "site-packages",
+                                                "mnemonic_proxy*")),
+                         "--check must not install the package")
+        self.assertFalse(os.path.exists(os.path.join(self.tree, "mnemonic_proxy.egg-info")),
+                         "--check must not leave install artifacts")
+
+    def test_check_ok_com_ambiente_valido_e_kv_disponivel(self):
+        """Full positive case: main venv valid with the package installed, and the KV
+        venv with compression.zstd. --check exits 0, reports kv_archive (zstd) yes,
+        and touches nothing: no file or directory of the two venvs is created,
+        removed or modified.
+
+        The KV support is simulated (stub wrapper) so the test does not depend on a
+        real Python >= 3.14 being installed."""
+        main = self.real_venv(".venv")
+        stub_packet(main)                 # bin/mnemonic-proxy + importable ctxproxy package
+        hide_zstd(main)                   # force KV to come from .venv314, even on a 3.14 host
+        # KV venv: a REAL venv (so the package probe works) marked as installed, with
+        # zstd support faked via sitecustomize -> setup.sh reuses it (it requires both
+        # the package and compression.zstd). No real Python >= 3.14 involved.
+        kv = self.real_venv(".venv314")
+        stub_packet(kv)
+        show_zstd(kv)
+
+        before = snapshot_tree(self.tree)
+
+        rc, out = self.setup(["--check"])
+
+        self.assertEqual(rc, 0, out)
+        self.assertIn("package yes", out)                 # main venv has the package
+        self.assertIn("kv_archive (zstd)   : yes", out)    # KV venv has compression.zstd
+        self.assertIn(" in %s" % os.path.join(self.tree, kv), out)
+        self.assertEqual(snapshot_tree(self.tree), before,
+                         "--check must not create, remove or modify any file")
+
     def test_no_kv_nao_tenta_uv_e_sai_zero(self):
         venv = self.real_venv(".venv")
         hide_zstd(venv)
@@ -547,6 +682,7 @@ class SetupScriptTests(unittest.TestCase):
         self.assertIn(": no", out)
         self.assertNotIn("creating %s" % os.path.join(self.tree, ".venv314"), out)
         self.assertNotIn("building .venv314", out)
+
     # ---- privileges (review points 1, 2 and 6) -------------------------------
     # A minimal PATH with NO python: the coreutils setup.sh uses before the Python
     # step (dirname, id), plus logging stubs for the package manager and for sudo.

@@ -242,8 +242,15 @@ if [ -z "$PY" ]; then
 fi
 
 # ---- 2) the proxy venv ------------------------------------------------------
-# a .venv from an interrupted run has a python without pip: start over
+# a .venv from an interrupted run has a python without pip: start over.
+# --check is strictly read-only: an incomplete venv is reported and left exactly
+# as it is (nothing removed, nothing recreated).
 if [ -x "$VENV_MAIN/bin/python" ] && ! venv_has_pip "$VENV_MAIN"; then
+  if [ "$CHECK" = 1 ]; then
+    say "MISSING: $VENV_MAIN is incomplete (its python has no pip, creation was interrupted)."
+    say "  run ./setup.sh to recreate it; --check leaves it untouched."
+    exit 1
+  fi
   if ! is_venv "$VENV_MAIN"; then
     printf 'setup.sh: %s exists without pip and is not a venv (no pyvenv.cfg): not removing it.\n' "$VENV_MAIN" >&2
     printf '  point VENV_MAIN to a free folder inside the project.\n' >&2
@@ -269,6 +276,12 @@ if [ ! -x "$VENV_MAIN/bin/python" ]; then
 fi
 
 if ! venv_has_pkg "$VENV_MAIN"; then
+  # --check is strictly read-only: report the missing package and stop before any
+  # pip/uv install (nothing is installed and no file in the environment is touched).
+  if [ "$CHECK" = 1 ]; then
+    say "MISSING: the mnemonic-proxy package is not installed in $VENV_MAIN (run ./setup.sh)."
+    exit 1
+  fi
   say "installing the mnemonic-proxy package in $VENV_MAIN ..."
   if [ -x "$VENV_MAIN/bin/pip" ]; then
     "$VENV_MAIN/bin/pip" install -q --upgrade pip >/dev/null 2>&1
