@@ -313,8 +313,14 @@ fi
 ok_py_kv() { "$1" -c 'import sys, venv, ensurepip, compression.zstd; sys.exit(0 if sys.version_info >= (3, 14) else 1)' 2>/dev/null; }
 pick_py_kv()
 {
-  for c in $KV_PYTHON python3.16 python3.15 python3.14; do
-    [ -n "$c" ] || continue
+  # KV_PYTHON first, as ONE path or command: no word splitting, so a path with
+  # spaces ("/opt/my python/bin/python3.14") or a relative one works. It takes
+  # priority over the automatic search and over the uv download.
+  if [ -n "$KV_PYTHON" ]; then
+    p=$(command -v -- "$KV_PYTHON" 2>/dev/null) || p="$KV_PYTHON"
+    if [ -x "$p" ] && ok_py_kv "$p"; then printf '%s\n' "$p"; return 0; fi
+  fi
+  for c in python3.16 python3.15 python3.14; do
     p=$(command -v "$c" 2>/dev/null) || continue
     if ok_py_kv "$p"; then printf '%s\n' "$p"; return 0; fi
   done

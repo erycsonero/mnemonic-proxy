@@ -154,6 +154,25 @@ def hide_zstd(venv):
                  "sys.meta_path.insert(0, _BlockZstd())\n")
 
 
+def fake_py314(path, valid=True):
+    """Create an executable that mimics the Python >= 3.14 interpreter probe.
+
+    setup.sh asks the interpreter a single question:
+        `python -c 'import sys, venv, ensurepip, compression.zstd; ...'`
+    valid=True makes that probe succeed (exit 0); valid=False makes it fail. Any
+    other invocation still delegates to the host interpreter, so this never depends
+    on a real Python 3.14 being installed. `path` may contain spaces."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    verdict = "0" if valid else "1"
+    body = ("if [ \"$1\" = \"-c\" ]; then\n"
+            "  case \"$2\" in *compression.zstd*) exit " + verdict + ";; esac\n"
+            "fi\n")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\n" + body + "exec " + sys.executable + " \"$@\"\n")
+    os.chmod(path, 0o755)
+    return path
+
+
 def tmp_abs(tree, name):
     return os.path.join(tree, name)
 
@@ -682,6 +701,70 @@ class SetupScriptTests(unittest.TestCase):
         self.assertIn(": no", out)
         self.assertNotIn("creating %s" % os.path.join(self.tree, ".venv314"), out)
         self.assertNotIn("building .venv314", out)
+
+    # ---- KV_PYTHON: one path, no word splitting -----------------------------
+    # setup.sh runs `./setup.sh --no-kv`? No: it looks for KV_PYTHON only when it
+    # must BUILD the KV venv. Each test forces that path with --no-kv absent and a
+    # main venv already complete, so the only variable is KV_PYTHON. The chosen
+    # interpreter is what appears in the "using ... for .venv314" line.
+    def kv_layout(self):
+        """A main venv complete (package present) so setup.sh only works on KV."""
+        main = self.real_venv(".venv")
+        stub_packet(main)
+        hide_zstd(main)          # force the KV search, even on a 3.14 host
+        return main
+
+    def clean_path(self, *extra):
+        """PATH with a python3.14 only where the test puts one, so a host python3.14
+        (e.g. ~/.local/bin) cannot mask the behaviour under test. The host interpreter
+        is exposed as `python3` (the main-venv step), never as `python3.14`."""
+        d = os.path.join(self.tree, "pathbin")
+        os.makedirs(d, exist_ok=True)
+        for tool in ("sh", "env", "dirname", "basename", "id", "rm", "mkdir", "cp",
+                     "sed", "grep", "uname", "tr", "cat", "head", "tail"):
+            src = shutil.which(tool)
+            if src and not os.path.exists(os.path.join(d, tool)):
+                os.symlink(src, os.path.join(d, tool))
+        for name in ("python3", "python"):
+            if not os.path.exists(os.path.join(d, name)):
+                os.symlink(sys.executable, os.path.join(d, name))
+        return os.pathsep.join([d] + list(extra))
+
+    def test_kv_python_valido_e_escolhido(self):
+        """KV_PYTHON pointing at a valid interpreter is used verbatim and wins over
+        the automatic search: with no python3.14 in PATH, only KV_PYTHON can match."""
+        self.kv_layout()
+        py = fake_py314(os.path.join(self.tree, "mypy", "python3.14"), valid=True)
+        rc, out = self.setup(["--no-sudo"], {"KV_PYTHON": py, "PATH": self.clean_path()})
+        self.assertIn("using %s" % py, out)
+
+    def test_kv_python_com_espacos_no_caminho(self):
+        """A path with spaces must be handled as ONE argument: word splitting would
+        break it and the interpreter would never be found."""
+        self.kv_layout()
+        py = fake_py314(os.path.join(self.tree, "dir com espaco", "python 3.14"), valid=True)
+        self.assertIn(" ", py)   # sanity: the fixture really has a space
+        rc, out = self.setup(["--no-sudo"], {"KV_PYTHON": py, "PATH": self.clean_path()})
+        self.assertIn("using %s" % py, out)
+
+    def test_kv_python_invalido_cai_na_busca_automatica(self):
+        """An invalid KV_PYTHON must not be used: the automatic search still runs.
+        Here a valid python3.14 sits in PATH and has to be picked instead."""
+        self.kv_layout()
+        bad = fake_py314(os.path.join(self.tree, "bad", "python3.14"), valid=False)
+        good = fake_py314(os.path.join(self.tree, "pathbin", "python3.14"), valid=True)
+        rc, out = self.setup(["--no-sudo"],
+                             {"KV_PYTHON": bad, "PATH": self.clean_path()})
+        self.assertIn("using %s" % good, out)
+        self.assertNotIn("using %s" % bad, out)
+
+    def test_kv_python_vazio_preserva_a_busca_atual(self):
+        """KV_PYTHON empty: behaviour is exactly as before — the automatic search
+        over python3.16 / python3.15 / python3.14 decides."""
+        self.kv_layout()
+        good = fake_py314(os.path.join(self.tree, "pathbin", "python3.14"), valid=True)
+        rc, out = self.setup(["--no-sudo"], {"KV_PYTHON": "", "PATH": self.clean_path()})
+        self.assertIn("using %s" % good, out)
 
     # ---- privileges (review points 1, 2 and 6) -------------------------------
     # A minimal PATH with NO python: the coreutils setup.sh uses before the Python
