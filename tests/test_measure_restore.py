@@ -191,5 +191,117 @@ class CliGuardTests(unittest.TestCase):
         self.assertIn("engine does not answer", out)
 
 
+
+class SameRequestTests(unittest.TestCase):
+    """The default method sends the SAME request twice. These tests use monkeypatch
+    so nothing touches a real engine or proxy."""
+
+    def setUp(self):
+        self.mod = load_tool()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.slot = os.path.join(self.tmp.name, "sessions")
+        os.makedirs(self.slot)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fake_args(self, **kw):
+        a = type("A", (), {})()
+        a.data = os.path.join(self.tmp.name, "data")
+        a.upstream = "http://x"
+        a.port = 8196
+        a.tokens = 100
+        a.probe_tokens = 50
+        a.idle = 0.0
+        for k, v in kw.items():
+            setattr(a, k, v)
+        return a
+
+    def test_measure_request_sends_the_messages_it_is_given(self):
+        """The request is NOT rebuilt: measure_request sends exactly the list passed in,
+        so both measurements use byte-identical messages."""
+        mod = self.mod
+        msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+        seen = []
+        mod.start_proxy = lambda *a, **k: (object(), "http://p", open(os.devnull, "w"))
+        mod.stop_proxy = lambda *a, **k: None
+        mod.write_cfg = lambda *a, **k: "/dev/null"
+        mod.free_port = lambda p: p
+        mod.journal_events = lambda *a, **k: [{"event": "request", "prompt_ms": 1.0}]
+        def fake_chat(base, model, messages, mx, **kw):
+            seen.append(list(messages))
+            return 1.0, {}, "ok"
+        mod.chat = fake_chat
+        a = self.fake_args()
+        out, rc = mod.measure_request(a, "m", msgs, False, self.slot, "bin", "", a.data, "control")
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen[0], msgs, "the measured request must be the list it was given")
+
+    def test_same_request_aborts_when_control_is_not_a_real_reread(self):
+        """Guard B: if the control request has reused>0, the engine kept the prefix and
+        the comparison would be against a cached prompt: abort with exit 1."""
+        mod = self.mod
+        state = {"calls": 0}
+        mod.free_port = lambda p: p
+        mod.write_cfg = lambda *a, **k: "/dev/null"
+        mod.start_proxy = lambda *a, **k: (object(), "http://p", open(os.devnull, "w"))
+        mod.stop_proxy = lambda *a, **k: None
+        mod.list_slot_files = lambda d: []
+        mod.prepare_a = lambda *a, **k: ([{"role": "user", "content": "u"}], {"event": "autosave"})
+        mod._evict_via_proxy = lambda *a, **k: None
+        def fake_measure(a, model, msgs_a, autorestore, slot_dir, proxy_bin, tok, data, tag):
+            state["calls"] += 1
+            return {"request": {"reused": 5, "prompt_ms": 10.0}, "autorestore": None}, 0
+        mod.measure_request = fake_measure
+        a = self.fake_args()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            results, rc = mod.run_same_request(a, "m", self.slot, "bin", "")
+        self.assertEqual(rc, 1, out.getvalue())
+        self.assertIn("did not re-read", out.getvalue())
+        self.assertEqual(state["calls"], 1, "it must abort before the restore measurement")
+
+    def test_same_request_aborts_without_autosave(self):
+        """Guard A: without an autosave there is nothing to restore: abort with exit 1."""
+        mod = self.mod
+        mod.free_port = lambda p: p
+        mod.write_cfg = lambda *a, **k: "/dev/null"
+        mod.start_proxy = lambda *a, **k: (object(), "http://p", open(os.devnull, "w"))
+        mod.stop_proxy = lambda *a, **k: None
+        mod.list_slot_files = lambda d: []
+        mod.prepare_a = lambda *a, **k: ([{"role": "user", "content": "u"}], None)
+        a = self.fake_args()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            results, rc = mod.run_same_request(a, "m", self.slot, "bin", "")
+        self.assertEqual(rc, 1, out.getvalue())
+        self.assertIn("no autosave", out.getvalue())
+
+    def test_same_request_happy_path_returns_both_sides(self):
+        """With an autosave and a clean control, the two measurements are reported."""
+        mod = self.mod
+        seq = [
+            ({"request": {"reused": 0, "prompt_ms": 30575.1}, "autorestore": None}, 0),      # control
+            ({"request": {"reused": 31425, "prompt_ms": 2357.0},
+              "autorestore": {"restore_ms": 2355.1, "tokens": 31430}}, 0),                     # restore
+        ]
+        it = iter(seq)
+        mod.free_port = lambda p: p
+        mod.write_cfg = lambda *a, **k: "/dev/null"
+        mod.start_proxy = lambda *a, **k: (object(), "http://p", open(os.devnull, "w"))
+        mod.stop_proxy = lambda *a, **k: None
+        mod.list_slot_files = lambda d: []
+        mod.prepare_a = lambda *a, **k: ([{"role": "user", "content": "u"}], {"event": "autosave"})
+        mod._evict_via_proxy = lambda *a, **k: None
+        mod.measure_request = lambda *a, **k: next(it)
+        a = self.fake_args()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            results, rc = mod.run_same_request(a, "m", self.slot, "bin", "")
+        self.assertEqual(rc, 0, out.getvalue())
+        self.assertEqual(results["method"], "same-request")
+        self.assertTrue(results["control"] and results["restore"])
+
+
 if __name__ == "__main__":
     unittest.main()
