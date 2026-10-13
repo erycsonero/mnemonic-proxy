@@ -15,16 +15,17 @@ Trigger 2 is not destructive: it works on the live engine. This script exploits 
   conversation B  uses the engine              -> A's state leaves memory
   conversation A  next request                 -> Tracker sees a different requests -> restore
 
-It measures BOTH sides of the comparison in the same run, using the timings the proxy
-itself records in the journal (prompt_ms / restore_ms), instead of extrapolating from
-wall-clock time:
+It measures BOTH sides on the SAME request, using the timings the proxy records in
+the journal (prompt_ms / restore_ms), instead of extrapolating from wall-clock time.
+Default method ("same request"): one conversation A, then the SAME request is sent
+twice, each time after B has evicted A from the engine:
 
-  control : A's request after B, with autorestore OFF -> real re-read (prompt_ms of the
-            whole re-read, from the journal)
-  restore : A's request after B, with autorestore ON  -> restore_ms + prompt_ms of the
-            few new tokens
+  A grows  -> autosave saves A.bin  -> freeze msgs_a
+  B fills the engine  -> request = msgs_a, autorestore OFF  -> control (real re-read)
+  B fills the engine  -> request = msgs_a, autorestore ON   -> restore + few new tokens
 
 The reported speed-up is control_ms / (restore_ms + new_tokens_ms).
+The older method, "--two-phases", runs a whole A/B cycle per phase instead.
 
 It starts a private proxy (--port, default 8196) with its own data dir in front of the
 SAME engine. It does not touch the running proxy and does not restart the engine.
@@ -51,6 +52,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -210,56 +212,179 @@ def journal_path(data):
     return os.path.join(data, "journal.jsonl")
 
 
-def run_phase(a, model, slot_dir, proxy_bin, tok, autorestore, phase_tag):
-    """One full phase: A grows -> autosave -> B evicts -> A's request, with the given
-    autorestore setting. Returns (dict with the journal-derived timings, exit code).
-
-    The journal is read only for events with a timestamp >= the phase start, so a
-    second run in the same data dir cannot pick up an event from the first one."""
-    phase_cfg = dict(TEST_CONFIG)
-    phase_cfg["autosave_idle_s"] = a.idle
-    phase_cfg["slot_dir"] = slot_dir
-    phase_cfg["autorestore"] = autorestore
-    data = a.data
+def write_cfg(data, slot_dir, autorestore, idle):
+    """Write the test proxy config and return its path."""
+    cfg = dict(TEST_CONFIG)
+    cfg["autosave_idle_s"] = idle
+    cfg["slot_dir"] = slot_dir
+    cfg["autorestore"] = autorestore
     os.makedirs(data, exist_ok=True)
-    cfgpath = os.path.join(data, "config.test.json")
-    with open(cfgpath, "w", encoding="utf-8") as f:
-        json.dump(phase_cfg, f, indent=2)
+    path = os.path.join(data, "config.test.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    return path
 
+
+def prepare_a(a, base, model, data, t0):
+    """Grow conversation A and wait for its autosave. Returns (msgs_a, autosave event).
+
+    msgs_a is frozen here: the same list is sent for both measurements."""
+    msgs_a = [{"role": "system", "content": "Answer in one line. Do not use tools."}]
+    grow(base, model, msgs_a, a.tokens, "A")
+    print("\nidle: waiting for autosave (autosave_idle_s=%ss) ..." % a.idle)
+    deadline = time.time() + a.idle + 60
+    saved = None
+    while time.time() < deadline:
+        time.sleep(3.0)
+        for e in journal_events(journal_path(data), since=t0):
+            if e.get("event") == "autosave":
+                saved = e
+        if saved:
+            break
+    if saved:
+        print("  autosave: file=%s tokens=%s n_saved=%s bytes=%s in %s ms (idle %ss)"
+              % (saved.get("file"), saved.get("tokens"), saved.get("n_saved"),
+                 saved.get("bytes"), saved.get("ms"), saved.get("idle_s")))
+    else:
+        print("  no autosave recorded: see", os.path.join(data, "proxy.log"))
+    return msgs_a, saved
+
+
+def evict(base, model, probe_tokens):
+    """Fill the engine with conversation B so A leaves its memory (the proxy sees it)."""
+    msgs_b = [{"role": "system", "content": "Answer in one line. Do not use tools."}]
+    grow(base, model, msgs_b, probe_tokens, "B")
+    return msgs_b
+
+
+def measure_request(a, model, msgs_a, autorestore, slot_dir, proxy_bin, tok, data, tag):
+    """Send msgs_a through a private proxy with the given autorestore setting and read
+    the timings from the journal. Returns (dict, exit code).
+
+    A fresh proxy is used because autorestore is read from the config at start-up: it
+    is how the flag changes between the two measurements. The engine is not touched.
+    The journal is filtered by the proxy's start time, so the two measurements in the
+    same data dir cannot pick up each other's events."""
+    cfgpath = write_cfg(data, slot_dir, autorestore, a.idle)
     port = free_port(a.port)
     t0 = time.time()
     proc, base, log = start_proxy(proxy_bin, a.upstream, port, data, cfgpath, tok)
     if proc is None:
-        print("\n[%s] test proxy did not come up; output in %s" % (phase_tag, os.path.join(data, "proxy.log")))
+        print("\n[%s] test proxy did not come up; output in %s" % (tag, os.path.join(data, "proxy.log")))
         return None, 2
+    out = {}
+    try:
+        print("\n[%s] request (autorestore %s) ..." % (tag, "ON" if autorestore else "OFF"))
+        ms, usage_r, _ = chat(base, model, msgs_a, 32)
+        evs = journal_events(journal_path(data), since=t0)
+        reqs = [e for e in evs if e.get("event") == "request"]
+        out["request"] = reqs[-1] if reqs else {}
+        restores = [e for e in evs if e.get("event") == "autorestore"]
+        out["autorestore"] = restores[-1] if restores else None
+        out["raw_request_ms"] = ms
+    finally:
+        stop_proxy(proc, log)
+    return out, 0
 
+def run_same_request(a, model, slot_dir, proxy_bin, tok):
+    """Default method: one conversation A and the SAME request twice, each time after B
+    evicted A from the engine. Returns (results, exit code).
+
+    control : autorestore OFF -> the engine must re-read A (prompt_ms = whole prompt)
+    restore : autorestore ON  -> restore_ms + prompt_ms of the few new tokens
+
+    Guards: it aborts if there was no autosave (nothing to restore) or if the control
+    did not really re-read (reused > 0: the engine kept the prefix, so the comparison
+    would be against a cached prompt, not a real re-read)."""
+    data = a.data
+    cfgpath = write_cfg(data, slot_dir, True, a.idle)
+    port = free_port(a.port)
+    t0 = time.time()
+    proc, base, log = start_proxy(proxy_bin, a.upstream, port, data, cfgpath, tok)
+    if proc is None:
+        print("\ntest proxy did not come up; output in %s" % os.path.join(data, "proxy.log"))
+        return None, 2
+    before = set(list_slot_files(slot_dir))
+    msgs_a = saved = None
+    try:
+        msgs_a, saved = prepare_a(a, base, model, data, t0)
+    finally:
+        stop_proxy(proc, log)
+    own = sorted(set(list_slot_files(slot_dir)) - before)
+
+    if not saved:
+        print("\nABORT: no autosave, there is nothing to restore (raise --idle or --tokens).")
+        return {"own_files": own}, 1
+
+    # control: the same request, autorestore OFF
+    _evict_via_proxy(a, model, proxy_bin, tok, slot_dir)
+    ctl, rc = measure_request(a, model, msgs_a, False, slot_dir, proxy_bin, tok, data, "control")
+    if rc != 0:
+        return {"own_files": own}, rc
+    ctl_req = ctl.get("request") or {}
+    if (ctl_req.get("reused") or 0) > 0:
+        print("\nABORT: the control did not re-read (reused=%s > 0): the engine kept the prefix,"
+              % ctl_req.get("reused"))
+        print("so the comparison would not be against a real re-read. Raise --probe-tokens so B")
+        print("really fills the engine.")
+        return {"control": ctl, "own_files": own}, 1
+
+    # restore: the same request, autorestore ON
+    _evict_via_proxy(a, model, proxy_bin, tok, slot_dir)
+    rst, rc = measure_request(a, model, msgs_a, True, slot_dir, proxy_bin, tok, data, "restore")
+    if rc != 0:
+        return {"control": ctl, "own_files": own}, rc
+
+    return {"control": ctl, "restore": rst, "method": "same-request", "own_files": own}, 0
+
+
+def _evict_via_proxy(a, model, proxy_bin, tok, slot_dir):
+    """Run conversation B through a private proxy so A leaves the engine memory."""
+    data = a.data
+    cfgpath = write_cfg(data, slot_dir, False, a.idle)
+    port = free_port(a.port)
+    proc, base, log = start_proxy(proxy_bin, a.upstream, port, data, cfgpath, tok)
+    if proc is None:
+        print("\n[evict] test proxy did not come up (%s)" % os.path.join(data, "proxy.log"))
+        return
+    try:
+        evict(base, model, a.probe_tokens)
+    finally:
+        stop_proxy(proc, log)
+
+
+def run_two_phases(a, model, slot_dir, proxy_bin, tok):
+    """Older method (--two-phases): a whole A/B cycle per phase. Kept for comparison."""
+    results = {"method": "two-phases", "own_files": []}
+    own = set()
+    for autorestore, key, tag in ((False, "control", "control"), (True, "restore", "restore")):
+        print("\n=== %s (autorestore %s) ===" % (tag.upper(), "ON" if autorestore else "OFF"))
+        out, rc = run_one_cycle(a, model, slot_dir, proxy_bin, tok, autorestore, tag)
+        if rc != 0:
+            results["own_files"] = sorted(own)
+            return results, rc
+        results[key] = out
+        own.update(out.get("own_files", []) if out else [])
+    results["own_files"] = sorted(own)
+    return results, 0
+
+
+def run_one_cycle(a, model, slot_dir, proxy_bin, tok, autorestore, tag):
+    """One A/B cycle ending in A's request, with the given autorestore setting."""
+    data = a.data
+    cfgpath = write_cfg(data, slot_dir, autorestore, a.idle)
+    port = free_port(a.port)
+    t0 = time.time()
+    proc, base, log = start_proxy(proxy_bin, a.upstream, port, data, cfgpath, tok)
+    if proc is None:
+        print("\n[%s] test proxy did not come up; output in %s" % (tag, os.path.join(data, "proxy.log")))
+        return None, 2
     before = set(list_slot_files(slot_dir))
     out = {}
     try:
-        msgs_a = [{"role": "system", "content": "Answer in one line. Do not use tools."}]
-        grow(base, model, msgs_a, a.tokens, "A")
-
-        print("\n[%s] idle: waiting for autosave (autosave_idle_s=%ss) ..." % (phase_tag, a.idle))
-        deadline = time.time() + a.idle + 60
-        saved = None
-        while time.time() < deadline:
-            time.sleep(3.0)
-            for e in journal_events(journal_path(data), since=t0):
-                if e.get("event") == "autosave":
-                    saved = e
-            if saved:
-                break
+        msgs_a, saved = prepare_a(a, base, model, data, t0)
         out["autosave"] = saved
-        if saved:
-            print("  autosave: file=%s tokens=%s n_saved=%s bytes=%s in %s ms (idle %ss)"
-                  % (saved.get("file"), saved.get("tokens"), saved.get("n_saved"),
-                     saved.get("bytes"), saved.get("ms"), saved.get("idle_s")))
-        else:
-            print("  no autosave recorded: see", os.path.join(data, "proxy.log"))
-
-        msgs_b = [{"role": "system", "content": "Answer in one line. Do not use tools."}]
-        grow(base, model, msgs_b, a.probe_tokens, "B")
-
+        evict(base, model, a.probe_tokens)
         msgs_a.append({"role": "user", "content": filler(900, 400)})
         ms, usage_r, _ = chat(base, model, msgs_a, 32)
         evs = journal_events(journal_path(data), since=t0)
@@ -270,7 +395,6 @@ def run_phase(a, model, slot_dir, proxy_bin, tok, autorestore, phase_tag):
         out["raw_request_ms"] = ms
     finally:
         stop_proxy(proc, log)
-
     out["own_files"] = sorted(set(list_slot_files(slot_dir)) - before)
     return out, 0
 
@@ -280,7 +404,12 @@ def print_report(results):
     ctl_req = ctl.get("request") or {}
     rst_req = rst.get("request") or {}
     rs = rst.get("autorestore") or {}
+    method = results.get("method") or "same-request"
 
+    if method == "same-request":
+        print("method: the SAME request, autorestore OFF then ON")
+    else:
+        print("method: two phases, a whole A/B cycle each")
     print("control (autorestore OFF):")
     print("  request: prompt=%s reused=%s read=%s, prompt_ms=%s  wall=%.0f ms"
           % (ctl_req.get("prompt_tokens"), ctl_req.get("reused"), ctl_req.get("prompt_read"),
@@ -310,7 +439,7 @@ def main(argv=None) -> int:
     ap.add_argument("--upstream", default="http://127.0.0.1:8080", help="engine (default: Strata on 8080)")
     ap.add_argument("--port", type=int, default=8196, help="test proxy port (default 8196)")
     ap.add_argument("--data", default="", help="test data dir (default: a fresh ./data-restore-test-<pid>)")
-    ap.add_argument("--slot-dir", default="", help="session-files dir (default: from config.json)")
+    ap.add_argument("--slot-dir", default="", help="saved-state dir, as the proxy uses it (default: config.json)")
     ap.add_argument("--tokens", type=int, default=24000, help="target prompt tokens for conversation A")
     ap.add_argument("--turn-tokens", type=int, default=4000, help="tokens per A turn")
     ap.add_argument("--probe-tokens", type=int, default=6000, help="tokens of conversation B (evicts A)")
@@ -318,41 +447,44 @@ def main(argv=None) -> int:
     ap.add_argument("--venv", default="", help="venv to use (default: .venv314 if present, else .venv)")
     ap.add_argument("--allow-shared-engine", action="store_true",
                     help="required: this benchmark evicts other sessions from the engine")
+    ap.add_argument("--two-phases", action="store_true", dest="two_phases",
+                    help="older method: a whole A/B cycle per phase (default: the same request twice)")
     ap.add_argument("--keep-data", action="store_true", help="do not delete the test data dir")
     ap.add_argument("--dry-run", action="store_true", help="print the plan only")
     a = ap.parse_args(argv)
     if not a.data:
         a.data = os.path.join(ROOT, "data-restore-test-%d" % os.getpid())
 
-    slot_dir = a.slot_dir
-    if not slot_dir:
-        cfgp = os.path.join(ROOT, "config.json")
-        if os.path.exists(cfgp):
-            try:
-                with open(cfgp, encoding="utf-8") as f:
-                    slot_dir = json.load(f).get("slot_dir", "")
-            except Exception:
-                slot_dir = ""
+    # slot_dir is the proxy's own concept (Config.slot_dir, resolved like the proxy does):
+    # the flag wins, otherwise the config.json in the repo root.
+    slot_dir = a.slot_dir or read_config_slot_dir()
+    if slot_dir:
+        slot_dir = os.path.abspath(os.path.expanduser(slot_dir))
 
     venv = a.venv
     if not venv:
         venv = ".venv314" if os.path.exists(os.path.join(ROOT, ".venv314/bin/mnemonic-proxy")) else ".venv"
     proxy_bin = os.path.join(ROOT, venv, "bin/mnemonic-proxy")
     tok = os.environ.get("TOKENIZER", "")
+    method = "two-phases" if a.two_phases else "same-request"
 
     print("=== plan ===")
     print("engine           :", a.upstream, "(the SAME one already running: nothing is restarted)")
     print("test proxy       :", proxy_bin, "data:", a.data)
-    print("session files    :", slot_dir or "(none: saved state unavailable)")
+    print("method           :", method)
+    print("saved-state dir  :", slot_dir or "(none: saved state unavailable)")
+    print("                   (only the files created by this run are removed at the end)")
     print("conversation A   : grows to ~%d tokens, idle %ss -> autosave" % (a.tokens, a.idle))
     print("conversation B   : ~%d tokens, fills the engine -> A's state leaves memory" % a.probe_tokens)
-    print("measurement      : control (autorestore OFF) vs restore (ON), both from the journal")
-    print("                   (prompt_ms / restore_ms, not an extrapolated wall time)")
+    if method == "same-request":
+        print("measurement      : the SAME request twice (autorestore OFF, then ON), from the journal")
+    else:
+        print("measurement      : two phases, a whole A/B cycle each (autorestore OFF, then ON)")
     print("shared engine    :", "allowed" if a.allow_shared_engine else "NOT allowed (need --allow-shared-engine)")
     if a.dry_run:
         return 0
     if not slot_dir:
-        print("\nMISSING: --slot-dir (the session-files dir, the same as the engine's --slot-save-path).")
+        print("\nMISSING: --slot-dir (the saved-state dir, the same the proxy gets as slot_dir).")
         return 2
     if not a.allow_shared_engine:
         print("\nREFUSING: this benchmark evicts other sessions from the engine.")
@@ -374,52 +506,64 @@ def main(argv=None) -> int:
         print("data dir %s already exists: removing it (start from scratch)" % a.data)
         shutil.rmtree(a.data, ignore_errors=True)
 
-    results = {"control": None, "restore": None, "engine": {"model": model, "upstream": a.upstream}}
-    own_files = set()
+    results = {}
+    rc = 0
     try:
-        print("\n=== phase 1/2: control (autorestore OFF) ===")
-        ctl, rc = run_phase(a, model, slot_dir, proxy_bin, tok, False, "control")
-        if rc != 0:
-            return rc
-        results["control"] = ctl
-        own_files.update(ctl.get("own_files", []) if ctl else [])
-
-        print("\n=== phase 2/2: restore (autorestore ON) ===")
-        rst, rc = run_phase(a, model, slot_dir, proxy_bin, tok, True, "restore")
-        if rc != 0:
-            return rc
-        results["restore"] = rst
-        own_files.update(rst.get("own_files", []) if rst else [])
+        if method == "same-request":
+            results, rc = run_same_request(a, model, slot_dir, proxy_bin, tok)
+        else:
+            results, rc = run_two_phases(a, model, slot_dir, proxy_bin, tok)
     finally:
-        # cleanup: remove ONLY the .bin files this run created
-        removed = []
-        for f in sorted(own_files):
-            try:
-                os.remove(os.path.join(slot_dir, f))
-                removed.append(f)
-            except OSError:
-                pass
-        if removed:
-            print("\ncleaned up %d .bin file(s) created by this run: %s" % (len(removed), ", ".join(removed)))
-        elif own_files:
-            print("\nnote: could not remove:", ", ".join(sorted(own_files)))
+        cleanup_slots(slot_dir, (results or {}).get("own_files") or [])
+        results = results or {}
+        print("\n=== result ===")
+        print_report(results)
+        try:                                   # write the result before the data dir may go
+            with open(os.path.join(a.data, "measure_result.json"), "w", encoding="utf-8") as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+            print("\nresults in", os.path.join(a.data, "measure_result.json"))
+        except OSError:
+            pass
         if a.keep_data:
             print("(data kept in %s)" % a.data)
         else:
             shutil.rmtree(a.data, ignore_errors=True)
 
-    print("\n=== result ===")
-    print_report(results)
-    with open(os.path.join(a.data, "measure_result.json"), "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
-    print("\nresults in", os.path.join(a.data, "measure_result.json"))
-
+    if rc != 0:
+        return rc
     if not (results.get("restore") or {}).get("autorestore"):
-        print("\nNOTHING restored: no autorestore event in phase 2.")
+        print("\nNOTHING restored: no autorestore event in the restore measurement.")
         print("If 'reused' is high in the request, the engine kept the prefix (engine checkpoint)")
         print("and the restore was not triggered: raise --probe-tokens so B really fills the engine.")
         return 1
     return 0
+
+
+def read_config_slot_dir():
+    """slot_dir from the repo-root config.json, the same value the proxy reads."""
+    cfgp = os.path.join(ROOT, "config.json")
+    if not os.path.exists(cfgp):
+        return ""
+    try:
+        with open(cfgp, encoding="utf-8") as f:
+            return json.load(f).get("slot_dir", "")
+    except Exception:
+        return ""
+
+
+def cleanup_slots(slot_dir, own_files):
+    """Remove only the files this run created (the diff taken before/after), and say so."""
+    removed = []
+    for f in sorted(own_files):
+        try:
+            os.remove(os.path.join(slot_dir, f))
+            removed.append(f)
+        except OSError:
+            pass
+    if removed:
+        print("\ncleaned up %d saved-state file(s) created by this run: %s" % (len(removed), ", ".join(removed)))
+    elif own_files:
+        print("\nnote: could not remove:", ", ".join(sorted(own_files)))
 
 if __name__ == "__main__":
     sys.exit(main())
