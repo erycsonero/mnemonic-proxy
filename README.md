@@ -772,9 +772,10 @@ question, measured with the same journal timings.
 
 Measured with **Strata 0.1.41** and **swift-1.5-iq3_xxs** (window 131072, prompt
 ~31.4K tokens) on an **RTX 5060 Ti 16 GB** (PCIe 3.0 x8), an **Intel Xeon E5-2699 v3**
-and **64 GB DDR4-2667**, with three runs of each method (six runs in total): the same
-request gave **~10–12×** (median 11.6×) — re-read ~30 s vs restore + new tokens ~2.7 s —
-and the two-phase method gave ~6.7× under the same conditions.
+and **64 GB DDR4-2667 running at 2133 MT/s** (the CPU's memory limit), with three runs
+of each method (six runs in total): the same request gave **~10–12×** (median 11.6×) —
+re-read ~30 s vs restore + new tokens ~2.7 s — and the two-phase method gave ~6.7×
+under the same conditions.
 
 It needs `--allow-shared-engine` because filling the engine with conversation B evicts
 other sessions; it removes only the files it created itself. Exit code 0 when a restore
