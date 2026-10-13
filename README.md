@@ -762,15 +762,23 @@ a `--watch` that never archived), 2 on a usage error.
 .venv314/bin/python tools/measure_restore.py --allow-shared-engine
 ```
 
-It runs two phases against the same live engine: **control** (autorestore off) gives the
-real re-read in `prompt_ms`, **restore** (autorestore on) gives `restore_ms` + the
-`prompt_ms` of the few new tokens, both from the journal — the speed-up is
-`control_ms / (restore_ms + new_ms)`, not an extrapolation. On an RTX 5060 Ti with
-swift-1.5-iq3_xxs (window 131072, prompt ~32K tokens) it measured **6.5x** (re-read
-30.6 s vs restore + new tokens 4.7 s). It needs `--allow-shared-engine` because filling
-the engine with conversation B evicts other sessions, and it removes only the `.bin`
-files it created itself. Exit code 0 when a restore was measured, 1 when nothing was
-restored, 2 on a usage error.
+It sends **the same request twice**, each time after B has evicted A from the engine:
+**control** (`autorestore` off) gives the real re-read, **restore** (`autorestore` on)
+gives `restore_ms` plus the few new tokens — both read from the journal, so the speed-up
+is `control_ms / (restore_ms + new_ms)`, not an extrapolation. `--two-phases` is the
+earlier method: it runs a whole A/B cycle per phase and re-sends A with one extra
+message, so its restore path also carries those new tokens — a slightly different
+question, measured with the same journal timings.
+
+Measured with **Strata 0.1.41** and **swift-1.5-iq3_xxs** (window 131072, prompt
+~31.4K tokens) on an **RTX 5060 Ti 16 GB** (PCIe 3.0 x8), an **Intel Xeon E5-2699 v3**
+and **64 GB DDR4-2667**, with three runs of each method (six runs in total): the same
+request gave **~10–12×** (median 11.6×) — re-read ~30 s vs restore + new tokens ~2.7 s —
+and the two-phase method gave ~6.7× under the same conditions.
+
+It needs `--allow-shared-engine` because filling the engine with conversation B evicts
+other sessions; it removes only the files it created itself. Exit code 0 when a restore
+was measured, 1 when nothing was restored, 2 on a usage error.
 
 ## Tests
 
