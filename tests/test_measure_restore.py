@@ -191,6 +191,63 @@ class CliGuardTests(unittest.TestCase):
         self.assertIn("engine does not answer", out)
 
 
+class DataDirGuardTests(unittest.TestCase):
+    """Blocking review point: an existing --data without the tool's marker must never be
+    removed. A typo like "--data data/" points at the proxy's real data dir, the one thing
+    the proxy promises never to lose."""
+
+    def setUp(self):
+        self.mod = load_tool()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_existing_dir_without_marker_is_refused_and_kept(self):
+        victim = os.path.join(self.d, "data")          # e.g. the proxy's real data dir
+        os.makedirs(os.path.join(victim, "sessions"))
+        with open(os.path.join(victim, "journal.jsonl"), "w") as f:
+            f.write('{"event": "request"}\n')
+        err = self.mod.prepare_data_dir(victim)
+        self.assertIsNotNone(err, "an existing dir without the marker must be refused")
+        self.assertTrue(os.path.exists(os.path.join(victim, "journal.jsonl")),
+                        "nothing may be removed from a dir we did not create")
+
+    def test_dir_with_marker_is_cleaned_and_reused(self):
+        mine = os.path.join(self.d, "data")
+        os.makedirs(mine)
+        with open(os.path.join(mine, self.mod.DATA_MARKER), "w") as f:
+            f.write("")
+        with open(os.path.join(mine, "old.txt"), "w") as f:
+            f.write("old")
+        err = self.mod.prepare_data_dir(mine)
+        self.assertIsNone(err)
+        self.assertFalse(os.path.exists(os.path.join(mine, "old.txt")))
+        self.assertTrue(os.path.isfile(os.path.join(mine, self.mod.DATA_MARKER)))
+
+    def test_fresh_dir_is_created_with_marker(self):
+        fresh = os.path.join(self.d, "new")
+        self.assertIsNone(self.mod.prepare_data_dir(fresh))
+        self.assertTrue(os.path.isfile(os.path.join(fresh, self.mod.DATA_MARKER)))
+
+    def test_main_refuses_existing_dir_without_marker(self):
+        """End to end through main(): exit 2 and the dir is left untouched."""
+        victim = os.path.join(self.d, "precious")
+        os.makedirs(victim)
+        with open(os.path.join(victim, "keep.txt"), "w") as f:
+            f.write("important")
+        slot = os.path.join(self.d, "slot")
+        os.makedirs(slot)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = self.mod.main(["--slot-dir", slot, "--data", victim,
+                                "--allow-shared-engine", "--upstream", "http://127.0.0.1:1"])
+        self.assertEqual(rc, 2, out.getvalue())
+        self.assertIn("REFUSING", out.getvalue())
+        self.assertTrue(os.path.exists(os.path.join(victim, "keep.txt")),
+                        "the existing data dir must not be removed")
+
 
 class SameRequestTests(unittest.TestCase):
     """The default method sends the SAME request twice. These tests use monkeypatch

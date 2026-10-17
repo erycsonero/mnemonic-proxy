@@ -31,8 +31,11 @@ It starts a private proxy (--port, default 8196) with its own data dir in front 
 SAME engine. It does not touch the running proxy and does not restart the engine.
 
 SAFETY: this benchmark evicts other sessions from the engine (conversation B fills the
-conversation state), so it requires an explicit --allow-shared-engine. It removes only
-the .bin files it created itself.
+conversation state), so it requires an explicit --allow-shared-engine; run it on an idle
+engine (saved-state files created by ANOTHER client during the run also appear in the
+before/after diff and are removed at the end). It removes only the .bin files it created
+itself. An existing --data is removed only if it carries the marker this tool writes:
+without it the tool refuses, because it may be the proxy's real data dir.
 
 Exit code: 0 when a restore was measured, 1 when nothing was restored (so it can be used
 in scripts), 2 on a usage/config error.
@@ -62,6 +65,10 @@ import urllib.request
 
 HERE = os.path.abspath(os.path.dirname(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
+
+# Marker written into the test data dir. It is what makes reusing a data dir safe: an
+# existing --data without it is refused, never removed (it may be the proxy's own dir).
+DATA_MARKER = ".measure_restore"
 
 # Test config. mask_trigger high: what is measured here is the cost of re-reading the
 # prompt, so the test conversation must not be masked ahead of time.
@@ -151,6 +158,8 @@ def journal_events(path: str, since: float | None = None) -> list:
                     continue
             out.append(e)
     return out
+
+
 def start_proxy(proxy_bin, upstream, port, data, cfgpath, tok):
     """Start the private test proxy and wait until /health is ok. -> (proc, base, log)."""
     base = "http://127.0.0.1:%d" % port
@@ -210,6 +219,24 @@ def list_slot_files(slot_dir):
 
 def journal_path(data):
     return os.path.join(data, "journal.jsonl")
+
+
+def prepare_data_dir(path):
+    """Prepare the test data dir. -> None if it is safe to use, else a refusal message.
+
+    A directory this tool did not create is never removed: without the marker it may be
+    the proxy's real data dir (a typo like "--data data/" is enough), the one thing the
+    proxy promises never to lose. With the marker it is ours, so it is cleaned for a
+    fresh run (old events cannot be reused) and the marker is written again."""
+    if os.path.exists(path) and not os.path.isfile(os.path.join(path, DATA_MARKER)):
+        return ("--data %s already exists and has no %s marker: it may be the proxy's "
+                "real data dir" % (path, DATA_MARKER))
+    if os.path.exists(path):
+        print("data dir %s already exists (marker found): removing it (start from scratch)" % path)
+        shutil.rmtree(path, ignore_errors=True)
+    os.makedirs(path, exist_ok=True)
+    open(os.path.join(path, DATA_MARKER), "w").close()
+    return None
 
 
 def write_cfg(data, slot_dir, autorestore, idle):
@@ -446,7 +473,9 @@ def main(argv=None) -> int:
     ap.add_argument("--idle", type=float, default=20.0, help="autosave_idle_s of the test (default 20)")
     ap.add_argument("--venv", default="", help="venv to use (default: .venv314 if present, else .venv)")
     ap.add_argument("--allow-shared-engine", action="store_true",
-                    help="required: this benchmark evicts other sessions from the engine")
+                    help="required: this benchmark evicts other sessions from the engine; "
+                         "run it on an idle one (saved-state files created by another client "
+                         "during the run are removed at the end)")
     ap.add_argument("--two-phases", action="store_true", dest="two_phases",
                     help="older method: a whole A/B cycle per phase (default: the same request twice)")
     ap.add_argument("--keep-data", action="store_true", help="do not delete the test data dir")
@@ -490,6 +519,16 @@ def main(argv=None) -> int:
         print("\nREFUSING: this benchmark evicts other sessions from the engine.")
         print("  Conversation B fills the conversation state of %s, kicking out whoever is using it" % a.upstream)
         print("  (your running proxy included). Run it on an idle engine and pass --allow-shared-engine.")
+        print("  Note: on a shared engine, saved-state files created by ANOTHER client during")
+        print("  the run also appear in the before/after diff and are removed at the end.")
+        return 2
+
+    # SAFETY: never remove a directory this tool did not create. An existing --data
+    # without our marker may be the proxy's real data dir (a typo like "data/" is enough).
+    err = prepare_data_dir(a.data)
+    if err:
+        print("\nREFUSING: %s" % err)
+        print("  Pass a new path, or delete it yourself if you are sure it is safe.")
         return 2
 
     try:
@@ -500,11 +539,6 @@ def main(argv=None) -> int:
     model = st.get("model") or "local-model"
     print("\nengine: model=%s started=%s requests=%s"
           % (model, st.get("started"), ((st.get("activity") or {}).get("requests")) or 0))
-
-    # a reused data dir from a previous run: start clean, so old events cannot be reused
-    if os.path.exists(a.data):
-        print("data dir %s already exists: removing it (start from scratch)" % a.data)
-        shutil.rmtree(a.data, ignore_errors=True)
 
     results = {}
     rc = 0
@@ -526,8 +560,10 @@ def main(argv=None) -> int:
             pass
         if a.keep_data:
             print("(data kept in %s)" % a.data)
-        else:
+        elif os.path.isfile(os.path.join(a.data, DATA_MARKER)):
             shutil.rmtree(a.data, ignore_errors=True)
+        else:                                  # not ours anymore: do not touch it
+            print("(not removing %s: the marker is gone, it is not ours)" % a.data)
 
     if rc != 0:
         return rc
