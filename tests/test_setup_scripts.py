@@ -42,7 +42,7 @@ def make_tree():
     tmp = tempfile.mkdtemp(prefix="mp-shell-")
     r = subprocess.run(["git", "archive", "HEAD"], cwd=ROOT, capture_output=True)
     if r.returncode != 0:
-        raise RuntimeError("git archive falhou: " + r.stderr.decode()[:200])
+        raise RuntimeError("git archive failed: " + r.stderr.decode()[:200])
     subprocess.run(["tar", "-x", "-C", tmp], input=r.stdout, check=True)
     for name in ("setup.sh", "run-strata-proxy.sh"):
         shutil.copy(os.path.join(ROOT, name), os.path.join(tmp, name))
@@ -233,6 +233,7 @@ def serve(code=200, sleep=0.0, body=None):
 
 
 
+@unittest.skipIf(os.name == "nt", "bash scripts, Linux only")
 class RunScriptTests(unittest.TestCase):
     """run-strata-proxy.sh: venv chosen by support, coherent created config, engine check."""
 
@@ -266,7 +267,7 @@ class RunScriptTests(unittest.TestCase):
         srv.server_close()
         return rc, out
 
-    def test_tokenizer_deduzido_do_config_do_motor(self):
+    def test_tokenizer_deduced_from_engine_config(self):
         """TOKENIZER is not mandatory: the launcher reads it from the "tokenizer" key
         of the engine JSON, as it already does with slot_save_path. No personal path
         in the launcher: whoever has the engine in any folder finds it automatically."""
@@ -281,7 +282,7 @@ class RunScriptTests(unittest.TestCase):
         self.assertIn("tokenizer=" + tok, out)
         self.assertIn("--tokenizer " + tok, out)
 
-    def test_sem_tokenizer_o_proxy_sobe_sem_o_argumento(self):
+    def test_without_tokenizer_the_proxy_starts_without_the_flag(self):
         """No tokenizer in the engine config: the launcher must not pass --tokenizer.
         The proxy counts chars / chars_per_token, which is the documented estimate —
         not an error, and no empty path is passed."""
@@ -291,7 +292,7 @@ class RunScriptTests(unittest.TestCase):
         self.assertNotIn("--tokenizer", out)
         self.assertIn("chars/3.5", out)
 
-    def test_dois_configs_sem_identificacao_nao_escolhe_nada(self):
+    def test_two_configs_without_identification_choose_nothing(self):
         """Two packs in the engine folder, no identifier of the engine in use: the
         launcher passes no --tokenizer and deduces no slot_dir. A file from another
         pack would give wrong numbers and sessions in the wrong place; the chars/3.5
@@ -317,7 +318,7 @@ class RunScriptTests(unittest.TestCase):
         self.assertIn("not identified", out)
         self.assertEqual(self.read_config()["slot_dir"], os.path.join(d, "sessions"))
 
-    def test_dois_configs_com_mesmo_model_name_nao_escolhe_nada(self):
+    def test_two_configs_with_same_model_name_choose_nothing(self):
         """Two files declaring the SAME model_name, each with its own tokenizer and
         slot: the engine's 'model' does not break the tie (it matches both) and the
         URL port matches none. Nothing is chosen — two candidates, an honest launcher."""
@@ -327,7 +328,7 @@ class RunScriptTests(unittest.TestCase):
                              os.path.join(self.tree, "sessB")),
                             ("coder", os.path.join(self.tree, "tokA"), 8081,
                              os.path.join(self.tree, "sessA"))])
-        with open(os.path.join(d, "strata-swift-copia.json"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(d, "strata-swift-copy.json"), "w", encoding="utf-8") as fh:
             json.dump({"model_name": "swift", "port": 9999,
                        "tokenizer": os.path.join(self.tree, "tokC"),
                        "slot_save_path": os.path.join(self.tree, "sessC")}, fh)
@@ -342,7 +343,7 @@ class RunScriptTests(unittest.TestCase):
         self.assertIn("not identified", out)
         self.assertEqual(self.read_config()["slot_dir"], os.path.join(d, "sessions"))
 
-    def test_model_do_motor_escolhe_tokenizer_e_slot_do_mesmo_pack(self):
+    def test_engine_model_picks_tokenizer_and_slot_from_the_same_pack(self):
         """With two configs, the 'model' from /v1/status decides the file: tokenizer and
         slot_dir come from the SAME pack (the one of the engine in use), not from the
         first in alphabetical order (coder sorts before swift, exactly what we don't want)."""
@@ -359,7 +360,7 @@ class RunScriptTests(unittest.TestCase):
         self.assertNotIn("tokA", out)
         self.assertEqual(self.read_config()["slot_dir"], os.path.join(self.tree, "sessB"))
 
-    def test_porta_da_url_escolhe_tokenizer_e_slot_do_mesmo_pack(self):
+    def test_url_port_picks_tokenizer_and_slot_from_the_same_pack(self):
         """Without 'model' in /v1/status, the URL port identifies the file: tokenizer
         and slot_dir come from the SAME pack, the one whose port matches STRATA_URL."""
         stub_venv(self.tree, ".venv")
@@ -381,7 +382,7 @@ class RunScriptTests(unittest.TestCase):
         self.assertNotIn("tokA", out)
         self.assertEqual(self.read_config()["slot_dir"], os.path.join(self.tree, "sessB"))
 
-    def test_arquivo_unico_da_pasta_preserva_o_comportamento(self):
+    def test_single_file_in_the_folder_keeps_the_behaviour(self):
         """A single JSON in the engine folder: tokenizer and slot_dir from that file,
         exactly as before the identification rule."""
         stub_venv(self.tree, ".venv")
@@ -396,7 +397,7 @@ class RunScriptTests(unittest.TestCase):
         self.assertIn("--tokenizer " + tok, out)
         self.assertEqual(self.read_config()["slot_dir"], slot)
 
-    def test_sem_slot_save_path_as_sessoes_vao_para_a_pasta_do_strata(self):
+    def test_without_slot_save_path_sessions_go_to_the_strata_folder(self):
         """A JSON without slot_save_path: nothing is invented. The slot falls back to
         the $STRATA_DIR/sessions convention and the tokenizer still comes from the same file."""
         stub_venv(self.tree, ".venv")
@@ -409,7 +410,7 @@ class RunScriptTests(unittest.TestCase):
         self.assertIn("--tokenizer " + tok, out)
         self.assertEqual(self.read_config()["slot_dir"], os.path.join(self.strata, "sessions"))
 
-    def test_tokenizer_e_slot_dir_explicitos_tem_precedencia(self):
+    def test_explicit_tokenizer_and_slot_dir_take_precedence(self):
         """TOKENIZER and SLOT_DIR given by the caller win, even with two configs and
         an engine that does not identify itself: the discovery does not overwrite them."""
         stub_venv(self.tree, ".venv")
@@ -430,7 +431,7 @@ class RunScriptTests(unittest.TestCase):
         self.assertEqual(self.read_config()["slot_dir"],
                          os.path.join(self.tree, "sess_escolhida"))
 
-    def test_sem_python_314_sobe_e_cria_config_sem_kv(self):
+    def test_without_python_314_starts_and_creates_config_without_kv(self):
         stub_venv(self.tree, ".venv")                      # python without compression.zstd
         rc, out = self.boot()
         self.assertEqual(rc, 0, out)
@@ -439,7 +440,7 @@ class RunScriptTests(unittest.TestCase):
         self.assertEqual(cfg["slot_dir"], os.path.join(self.tree, "sessions"))
         self.assertIn("kv_archive=off", out)
 
-    def test_com_suporte_o_config_nasce_com_kv_off_e_avisa_como_ligar(self):
+    def test_with_support_new_config_is_born_with_kv_off_and_says_how_to_enable(self):
         """kv_archive is opt-in (experimental): even with Python 3.14 available the
         created config is born with kv_archive=false, and the output shows how to enable it."""
         stub_venv(self.tree, ".venv314", kv=True)
@@ -449,14 +450,14 @@ class RunScriptTests(unittest.TestCase):
         self.assertIn("kv_archive=off", out)
         self.assertIn("KV_ARCHIVE=1", out)
 
-    def test_kv_opt_in_com_suporte_cria_config_com_kv(self):
+    def test_kv_opt_in_with_support_creates_config_with_kv(self):
         stub_venv(self.tree, ".venv314", kv=True)
         rc, out = self.boot(extra={"KV_ARCHIVE": "1"})
         self.assertEqual(rc, 0, out)
         self.assertIs(self.read_config()["kv_archive"], True)
         self.assertIn("kv_archive=on", out)
 
-    def test_kv_opt_in_sem_suporte_cria_config_sem_kv_e_avisa(self):
+    def test_kv_opt_in_without_support_creates_config_without_kv_and_warns(self):
         """KV_ARCHIVE=1 without Python 3.14: the config is born without kv and the reason is printed."""
         stub_venv(self.tree, ".venv")                        # zstd probe blocked by the stub
         rc, out = self.boot(extra={"KV_ARCHIVE": "1"})
@@ -465,7 +466,7 @@ class RunScriptTests(unittest.TestCase):
         self.assertIn("KV_ARCHIVE=1 ignored", out)
         self.assertIn("kv_archive=off", out)
 
-    def test_escolhe_o_venv_que_tem_suporte(self):
+    def test_picks_the_venv_that_has_support(self):
         stub_venv(self.tree, ".venv")
         stub_venv(self.tree, ".venv314", kv=True)
         rc, out = self.boot(extra={"KV_ARCHIVE": "1"})
@@ -473,7 +474,7 @@ class RunScriptTests(unittest.TestCase):
         self.assertIn("venv=.venv314", out)
         self.assertIn("kv_archive=on", out)
 
-    def test_slot_dir_ausente_avisa_sem_falhar(self):
+    def test_missing_slot_dir_warns_without_failing(self):
         """The effective slot_dir is printed; if the folder does not exist, a warning
         with the mkdir command (saved state has nowhere to write), but the proxy starts."""
         stub_venv(self.tree, ".venv")
@@ -484,76 +485,76 @@ class RunScriptTests(unittest.TestCase):
         self.assertIn('mkdir -p "%s"' % slot, out)
         self.assertIn("slot_dir=" + slot, out)
 
-    def test_slot_dir_presente_nao_avisa(self):
+    def test_present_slot_dir_does_not_warn(self):
         stub_venv(self.tree, ".venv")
         os.makedirs(os.path.join(self.tree, "sessions"))
         rc, out = self.boot()
         self.assertEqual(rc, 0, out)
         self.assertNotIn("does not exist", out)
 
-    def test_config_pessoal_com_kv_sem_suporte_falha_sem_tocar_no_config(self):
+    def test_personal_config_with_kv_without_support_fails_without_touching_the_config(self):
         stub_venv(self.tree, ".venv")
-        self.write_config({"slot_dir": "/meu/slot", "kv_archive": True, "response_floor": 16384})
-        antes = open(self.cfg, "rb").read()
+        self.write_config({"slot_dir": "/my/slot", "kv_archive": True, "response_floor": 16384})
+        before = open(self.cfg, "rb").read()
         rc, out = self.boot()
         self.assertNotEqual(rc, 0)
         self.assertIn("compression.zstd", out)
         self.assertIn("was not modified", out)
-        self.assertEqual(open(self.cfg, "rb").read(), antes, "a personal config must not be modified")
-        self.assertEqual(self.read_config()["slot_dir"], "/meu/slot")
+        self.assertEqual(open(self.cfg, "rb").read(), before, "a personal config must not be modified")
+        self.assertEqual(self.read_config()["slot_dir"], "/my/slot")
 
-    def test_config_pessoal_sem_kv_sobe_sem_314(self):
+    def test_personal_config_without_kv_starts_without_314(self):
         stub_venv(self.tree, ".venv")
-        self.write_config({"slot_dir": "/meu/slot", "kv_archive": False})
+        self.write_config({"slot_dir": "/my/slot", "kv_archive": False})
         rc, out = self.boot()
         self.assertEqual(rc, 0, out)
         self.assertIn("kv_archive=off", out)
         self.assertIn("--config ./config.json", out)
 
-    def test_config_pessoal_sem_chave_kv_e_tratado_como_sem_kv(self):
+    def test_personal_config_without_kv_key_is_treated_as_without_kv(self):
         stub_venv(self.tree, ".venv")
-        self.write_config({"slot_dir": "/meu/slot"})
+        self.write_config({"slot_dir": "/my/slot"})
         rc, out = self.boot()
         self.assertEqual(rc, 0, out)
         self.assertIn("kv_archive=off", out)
 
-    def test_json_do_config_invalido_falha(self):
+    def test_invalid_config_json_fails(self):
         stub_venv(self.tree, ".venv")
         with open(self.cfg, "w", encoding="utf-8") as fh:
-            fh.write("{ isto nao e json")
+            fh.write("{ this is not json")
         rc, out = self.boot()
         self.assertNotEqual(rc, 0)
         self.assertIn("invalid JSON", out)
 
-    def test_http_503_do_motor_e_erro(self):
+    def test_engine_http_503_is_an_error(self):
         stub_venv(self.tree, ".venv")
         rc, out = self.boot(code=503)
         self.assertNotEqual(rc, 0)
         self.assertIn("HTTP 503", out)
 
-    def test_http_404_de_porta_de_outra_coisa_e_erro(self):
+    def test_http_404_from_another_service_is_an_error(self):
         stub_venv(self.tree, ".venv")
         rc, out = self.boot(code=404)
         self.assertNotEqual(rc, 0)
         self.assertIn("HTTP 404", out)
 
-    def test_conn_recusada_e_erro(self):
+    def test_refused_connection_is_an_error(self):
         stub_venv(self.tree, ".venv")
         rc, out = self.boot(extra={"STRATA_URL": "http://127.0.0.1:1"})
         self.assertNotEqual(rc, 0)
         self.assertIn("connection", out)
 
-    def test_timeout_e_erro(self):
+    def test_timeout_is_an_error(self):
         stub_venv(self.tree, ".venv")
         rc, out = self.boot(sleep=3.0, extra={"PROBE_TIMEOUT": "1"})
         self.assertNotEqual(rc, 0)
         self.assertIn("connection", out)
 
-    def test_timeout_invalido_sem_curl_nao_inventa_http(self):
+    def test_invalid_timeout_without_curl_does_not_invent_an_http_code(self):
         """Without curl the probe falls back to python: a non-numeric PROBE_TIMEOUT must
         not produce an empty HTTP code, which would be read as 'the port answered'."""
         stub_venv(self.tree, ".venv")
-        self.write_config({"slot_dir": "/meu/slot", "kv_archive": False})
+        self.write_config({"slot_dir": "/my/slot", "kv_archive": False})
         nobin = os.path.join(self.tree, "nobin")
         os.makedirs(nobin, exist_ok=True)
         os.symlink(shutil.which("dirname"), os.path.join(nobin, "dirname"))
@@ -563,12 +564,12 @@ class RunScriptTests(unittest.TestCase):
         self.assertIn("connection", out)
         self.assertNotIn("answered HTTP", out)
 
-    def test_sem_venv_nao_sobe(self):
+    def test_without_venv_does_not_start(self):
         rc, out = self.boot()
         self.assertNotEqual(rc, 0)
 
 
-def python_sem_pip(path):
+def python_without_pip(path):
     """a python that fails on `-m pip`: what an interrupted venv looks like to setup.sh."""
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("#!/bin/sh\n"
@@ -577,6 +578,7 @@ def python_sem_pip(path):
     os.chmod(path, 0o755)
 
 
+@unittest.skipIf(os.name == "nt", "bash scripts, Linux only")
 class SetupScriptTests(unittest.TestCase):
     """setup.sh: checking without Python 3.14 and watched paths before any rm -rf."""
 
@@ -599,7 +601,7 @@ class SetupScriptTests(unittest.TestCase):
     def setup(self, args=(), env=None):
         return run(["./setup.sh"] + list(args), cwd=self.tree, env=env or {}, timeout=600)
 
-    def test_sintaxe_posix_e_bash(self):
+    def test_posix_and_bash_syntax(self):
         for name in ("setup.sh", "run-strata-proxy.sh"):
             for shell in ("sh", "bash"):
                 if shutil.which(shell) is None:
@@ -607,7 +609,7 @@ class SetupScriptTests(unittest.TestCase):
                 rc, out = run([shell, "-n", name], cwd=self.tree)
                 self.assertEqual(rc, 0, "%s -n %s: %s" % (shell, name, out))
 
-    def test_check_passa_sem_python_314(self):
+    def test_check_passes_without_python_314(self):
         """A valid environment (venv + installed package) passes --check with exit 0,
         even without Python 3.14: the missing kv_archive is opt-in, not a failure."""
         venv = self.real_venv(".venv")
@@ -618,13 +620,13 @@ class SetupScriptTests(unittest.TestCase):
         self.assertIn("kv_archive (zstd)", out)
         self.assertIn(": no", out)
 
-    def test_check_falha_sem_venv(self):
+    def test_check_fails_without_venv(self):
         rc, out = self.setup(["--check"])
         self.assertEqual(rc, 1, out)
         self.assertIn("MISSING", out)
 
 # ---- --check is read-only (no removal, no creation, no install) ----------
-    def test_check_nao_remove_venv_incompleto(self):
+    def test_check_does_not_remove_an_incomplete_venv(self):
         """A venv whose python has no pip (interrupted creation): --check reports it
         and exits non-zero, leaving the directory exactly as it was — no rm -rf, no
         recreation (that is what a plain ./setup.sh does)."""
@@ -635,7 +637,7 @@ class SetupScriptTests(unittest.TestCase):
         marker = os.path.join(self.tree, ".venv", "marker.txt")
         with open(marker, "w", encoding="utf-8") as fh:
             fh.write("untouched")
-        python_sem_pip(os.path.join(binp, "python"))
+        python_without_pip(os.path.join(binp, "python"))
 
         rc, out = self.setup(["--check"])
 
@@ -647,7 +649,7 @@ class SetupScriptTests(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(binp, "python")),
                         "--check must not recreate the venv")
 
-    def test_check_nao_instala_pacote_ausente(self):
+    def test_check_does_not_install_a_missing_package(self):
         """A venv with a working python+pip but without the package: --check reports
         the missing package, exits non-zero and installs nothing — no setup/egg-info
         is created, so the environment is untouched."""
@@ -663,7 +665,7 @@ class SetupScriptTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.tree, "mnemonic_proxy.egg-info")),
                          "--check must not leave install artifacts")
 
-    def test_check_ok_com_ambiente_valido_e_kv_disponivel(self):
+    def test_check_ok_with_a_valid_env_and_kv_available(self):
         """Full positive case: main venv valid with the package installed, and the KV
         venv with compression.zstd. --check exits 0, reports kv_archive (zstd) yes,
         and touches nothing: no file or directory of the two venvs is created,
@@ -692,7 +694,7 @@ class SetupScriptTests(unittest.TestCase):
         self.assertEqual(snapshot_tree(self.tree), before,
                          "--check must not create, remove or modify any file")
 
-    def test_no_kv_nao_tenta_uv_e_sai_zero(self):
+    def test_no_kv_does_not_try_uv_and_exits_zero(self):
         venv = self.real_venv(".venv")
         hide_zstd(venv)
         rc, out = self.setup(["--no-sudo", "--no-kv"])
@@ -730,7 +732,7 @@ class SetupScriptTests(unittest.TestCase):
                 os.symlink(sys.executable, os.path.join(d, name))
         return os.pathsep.join([d] + list(extra))
 
-    def test_kv_python_valido_e_escolhido(self):
+    def test_valid_kv_python_is_chosen(self):
         """KV_PYTHON pointing at a valid interpreter is used verbatim and wins over
         the automatic search: with no python3.14 in PATH, only KV_PYTHON can match."""
         self.kv_layout()
@@ -738,16 +740,16 @@ class SetupScriptTests(unittest.TestCase):
         rc, out = self.setup(["--no-sudo"], {"KV_PYTHON": py, "PATH": self.clean_path()})
         self.assertIn("using %s" % py, out)
 
-    def test_kv_python_com_espacos_no_caminho(self):
+    def test_kv_python_with_spaces_in_the_path(self):
         """A path with spaces must be handled as ONE argument: word splitting would
         break it and the interpreter would never be found."""
         self.kv_layout()
-        py = fake_py314(os.path.join(self.tree, "dir com espaco", "python 3.14"), valid=True)
+        py = fake_py314(os.path.join(self.tree, "dir with space", "python 3.14"), valid=True)
         self.assertIn(" ", py)   # sanity: the fixture really has a space
         rc, out = self.setup(["--no-sudo"], {"KV_PYTHON": py, "PATH": self.clean_path()})
         self.assertIn("using %s" % py, out)
 
-    def test_kv_python_invalido_cai_na_busca_automatica(self):
+    def test_invalid_kv_python_falls_back_to_the_automatic_search(self):
         """An invalid KV_PYTHON must not be used: the automatic search still runs.
         Here a valid python3.14 sits in PATH and has to be picked instead."""
         self.kv_layout()
@@ -758,7 +760,7 @@ class SetupScriptTests(unittest.TestCase):
         self.assertIn("using %s" % good, out)
         self.assertNotIn("using %s" % bad, out)
 
-    def test_kv_python_vazio_preserva_a_busca_atual(self):
+    def test_empty_kv_python_keeps_the_current_search(self):
         """KV_PYTHON empty: behaviour is exactly as before — the automatic search
         over python3.16 / python3.15 / python3.14 decides."""
         self.kv_layout()
@@ -800,7 +802,7 @@ class SetupScriptTests(unittest.TestCase):
         with open(self.shimlog, encoding="utf-8") as fh:
             return fh.read()
 
-    def test_sem_python_o_padrao_e_mostrar_o_comando_e_parar(self):
+    def test_without_python_the_default_is_to_print_the_command_and_stop(self):
         """Without Python and without --install-deps: the script prints the command of
         the detected package manager and exits 1 — calling neither sudo nor the
         package manager (review point 6)."""
@@ -812,7 +814,7 @@ class SetupScriptTests(unittest.TestCase):
         self.assertIn("--install-deps", out)
         self.assertEqual(self.shim_log(), "", "default mode must not run sudo or the package manager")
 
-    def test_hint_segue_o_gerenciador_detectado(self):
+    def test_hint_follows_the_detected_package_manager(self):
         """On a Fedora machine (dnf, no apt-get) the hint shows the dnf command,
         not the apt one (review point 2)."""
         d = self.shim_bin(pm="dnf")
@@ -821,17 +823,17 @@ class SetupScriptTests(unittest.TestCase):
         self.assertIn("sudo dnf install -y python3 python3-pip", out)
         self.assertNotIn("apt-get install", out)
 
-    def test_install_deps_roda_via_sudo_fora_de_root(self):
+    def test_install_deps_runs_via_sudo_when_not_root(self):
         """--install-deps as a non-root user: the package manager runs via sudo (review point 6)."""
         d = self.shim_bin(pm="apt")
         rc, out = self.setup(["--install-deps"], {"PATH": d})
-        self.assertEqual(rc, 1, out)   # instala, mas continua sem python -> para com explicacao
+        self.assertEqual(rc, 1, out)   # installs, but still no python -> stops with an explanation
         self.assertIn("still no Python 3.10+", out)
         log = self.shim_log()
         self.assertIn("sudo apt-get update", log)
         self.assertIn("sudo apt-get install -y python3 python3-venv python3-pip", log)
 
-    def test_install_deps_como_root_chama_direto_sem_sudo(self):
+    def test_install_deps_as_root_calls_directly_without_sudo(self):
         """--install-deps as root (containers, WSL): the package manager runs DIRECTLY,
         without sudo — the case that failed on a clean Ubuntu 24.04 (review point 1)."""
         d = self.shim_bin(pm="apt", root=True)
@@ -842,7 +844,7 @@ class SetupScriptTests(unittest.TestCase):
         self.assertIn("apt-get update", log)
         self.assertIn("apt-get install -y python3 python3-venv python3-pip", log)
 
-    def test_root_sem_sudo_o_hint_nao_tem_prefixo(self):
+    def test_root_without_sudo_hint_has_no_prefix(self):
         """As root (id -u = 0) the printed command has no sudo prefix: it is the
         command the root user should run."""
         d = self.shim_bin(pm="apt", root=True)
@@ -853,54 +855,54 @@ class SetupScriptTests(unittest.TestCase):
 
 
 
-    def test_venv_main_fora_do_projeto_nada_e_removido(self):
-        fora = tempfile.mkdtemp(prefix="mp-fora-")
-        marcador = os.path.join(fora, "marcador.txt")
-        with open(marcador, "w", encoding="utf-8") as fh:
+    def test_venv_main_outside_the_project_removes_nothing(self):
+        outside = tempfile.mkdtemp(prefix="mp-outside-")
+        marker = os.path.join(outside, "marker.txt")
+        with open(marker, "w", encoding="utf-8") as fh:
             fh.write("intact")
-        rc, out = self.setup(["--no-sudo"], {"VENV_MAIN": fora})
+        rc, out = self.setup(["--no-sudo"], {"VENV_MAIN": outside})
         self.assertEqual(rc, 2, out)
         self.assertIn("unsafe", out)
         self.assertIn("Nothing was removed", out)
-        self.assertTrue(os.path.exists(marcador), "nothing may be deleted outside the project")
-        shutil.rmtree(fora, ignore_errors=True)
+        self.assertTrue(os.path.exists(marker), "nothing may be deleted outside the project")
+        shutil.rmtree(outside, ignore_errors=True)
 
-    def test_venv_main_com_dotdot_e_recusado(self):
-        rc, out = self.setup(["--no-sudo"], {"VENV_MAIN": "../fora"})
+    def test_venv_main_with_dotdot_is_refused(self):
+        rc, out = self.setup(["--no-sudo"], {"VENV_MAIN": "../outside"})
         self.assertEqual(rc, 2, out)
         self.assertIn("unsafe", out)
 
-    def test_venv_main_raiz_do_projeto_e_recusada(self):
+    def test_venv_main_project_root_is_refused(self):
         rc, out = self.setup(["--no-sudo"], {"VENV_MAIN": "."})
         self.assertEqual(rc, 2, out)
         self.assertIn("unsafe", out)
 
-    def test_venv_kv_caminho_da_home_e_recusado(self):
+    def test_venv_kv_home_path_is_refused(self):
         rc, out = self.setup(["--no-sudo"], {"HOME": self.tree, "VENV_KV": self.tree + "/.venv314"})
         self.assertEqual(rc, 2, out)
         self.assertIn("unsafe", out)
 
-    def test_venv_main_symlink_e_recusado(self):
-        alvo = os.path.join(self.tree, "alvo")
-        os.makedirs(alvo)
-        os.symlink(alvo, os.path.join(self.tree, ".venv"))
+    def test_venv_main_symlink_is_refused(self):
+        target = os.path.join(self.tree, "target")
+        os.makedirs(target)
+        os.symlink(target, os.path.join(self.tree, ".venv"))
         rc, out = self.setup(["--no-sudo"], {"VENV_MAIN": ".venv"})
         self.assertEqual(rc, 2, out)
         self.assertIn("unsafe", out)
 
-    def test_nao_remove_pasta_que_nao_e_venv(self):
+    def test_does_not_remove_a_folder_that_is_not_a_venv(self):
         binp = os.path.join(self.tree, ".venv", "bin")
         os.makedirs(binp)
-        python_sem_pip(os.path.join(binp, "python"))
-        marcador = os.path.join(self.tree, ".venv", "marcador.txt")
-        with open(marcador, "w", encoding="utf-8") as fh:
+        python_without_pip(os.path.join(binp, "python"))
+        marker = os.path.join(self.tree, ".venv", "marker.txt")
+        with open(marker, "w", encoding="utf-8") as fh:
             fh.write("intact")
         rc, out = self.setup(["--no-sudo", "--no-kv"])
         self.assertEqual(rc, 2, out)
         self.assertIn("not a venv", out)
-        self.assertTrue(os.path.exists(marcador), "without pyvenv.cfg nothing is removed")
+        self.assertTrue(os.path.exists(marker), "without pyvenv.cfg nothing is removed")
 
-    def test_venv_em_subpasta_inexistente_e_aceito(self):
+    def test_venv_in_a_missing_subfolder_is_accepted(self):
         """A legitimate path inside the project whose parent does not exist yet
         (VENV_MAIN=venvs/kv314): the normal case of someone choosing where to
         create the venv, and it must not be read as 'unsafe'."""
@@ -908,47 +910,47 @@ class SetupScriptTests(unittest.TestCase):
         self.assertNotIn("unsafe", out)
         self.assertNotEqual(rc, 2, out)
 
-    def test_pai_symlink_para_fora_nada_e_removido(self):
+    def test_parent_symlink_pointing_outside_removes_nothing(self):
         """shortcut -> a folder outside; shortcut/.venv is a legitimate venv out there.
         rm -rf would follow the symlink: the validation must catch the ancestor,
         not just the leaf."""
-        fora = tempfile.mkdtemp(prefix="mp-fora-")
-        ext = os.path.join(fora, ".venv")
-        os.makedirs(os.path.join(ext, "bin"))
-        with open(os.path.join(ext, "pyvenv.cfg"), "w", encoding="utf-8") as fh:
+        outside = tempfile.mkdtemp(prefix="mp-outside-")
+        external = os.path.join(outside, ".venv")
+        os.makedirs(os.path.join(external, "bin"))
+        with open(os.path.join(external, "pyvenv.cfg"), "w", encoding="utf-8") as fh:
             fh.write("home = %s\n" % os.path.dirname(sys.executable))
-        python_sem_pip(os.path.join(ext, "bin", "python"))
-        marcador = os.path.join(ext, "marcador.txt")
-        with open(marcador, "w", encoding="utf-8") as fh:
+        python_without_pip(os.path.join(external, "bin", "python"))
+        marker = os.path.join(external, "marker.txt")
+        with open(marker, "w", encoding="utf-8") as fh:
             fh.write("intact")
-        os.symlink(fora, os.path.join(self.tree, "atalho"))
-        rc, out = self.setup(["--no-sudo", "--no-kv"], {"VENV_MAIN": "atalho/.venv"})
+        os.symlink(outside, os.path.join(self.tree, "shortcut"))
+        rc, out = self.setup(["--no-sudo", "--no-kv"], {"VENV_MAIN": "shortcut/.venv"})
         self.assertEqual(rc, 2, out)
         self.assertIn("unsafe", out)
         self.assertIn("Nothing was removed", out)
-        self.assertTrue(os.path.isdir(ext), "the external venv must not be removed")
-        self.assertTrue(os.path.exists(marcador), "the external content must not be touched")
-        shutil.rmtree(fora, ignore_errors=True)
+        self.assertTrue(os.path.isdir(external), "the external venv must not be removed")
+        self.assertTrue(os.path.exists(marker), "the external content must not be touched")
+        shutil.rmtree(outside, ignore_errors=True)
 
-    def test_ancestral_symlink_em_caminho_absoluto_tambem_e_recusado(self):
-        fora = tempfile.mkdtemp(prefix="mp-fora-")
-        ext = os.path.join(fora, ".venv")
-        os.makedirs(os.path.join(ext, "bin"))
-        with open(os.path.join(ext, "pyvenv.cfg"), "w", encoding="utf-8") as fh:
+    def test_ancestor_symlink_in_an_absolute_path_is_also_refused(self):
+        outside = tempfile.mkdtemp(prefix="mp-outside-")
+        external = os.path.join(outside, ".venv")
+        os.makedirs(os.path.join(external, "bin"))
+        with open(os.path.join(external, "pyvenv.cfg"), "w", encoding="utf-8") as fh:
             fh.write("home = x\n")
-        python_sem_pip(os.path.join(ext, "bin", "python"))
-        marcador = os.path.join(ext, "marcador.txt")
-        with open(marcador, "w", encoding="utf-8") as fh:
+        python_without_pip(os.path.join(external, "bin", "python"))
+        marker = os.path.join(external, "marker.txt")
+        with open(marker, "w", encoding="utf-8") as fh:
             fh.write("intact")
-        os.symlink(fora, os.path.join(self.tree, "atalho"))
+        os.symlink(outside, os.path.join(self.tree, "shortcut"))
         rc, out = self.setup(["--no-sudo", "--no-kv"],
-                             {"VENV_MAIN": os.path.join(self.tree, "atalho", ".venv")})
+                             {"VENV_MAIN": os.path.join(self.tree, "shortcut", ".venv")})
         self.assertEqual(rc, 2, out)
         self.assertIn("unsafe", out)
-        self.assertTrue(os.path.exists(marcador), "the external content must not be touched")
-        shutil.rmtree(fora, ignore_errors=True)
+        self.assertTrue(os.path.exists(marker), "the external content must not be touched")
+        shutil.rmtree(outside, ignore_errors=True)
 
-    def test_venv_em_subpasta_do_projeto_continua_aceito(self):
+    def test_venv_in_a_project_subfolder_is_still_accepted(self):
         """The validation must not restrict beyond what the interface documents: a
         legitimate VENV_MAIN in a subfolder must pass (and the setup carries on)."""
         os.makedirs(os.path.join(self.tree, "sub"))
@@ -957,7 +959,8 @@ class SetupScriptTests(unittest.TestCase):
         self.assertNotEqual(rc, 2, out)
         self.assertNotIn("unsafe", out)
         self.assertEqual(rc, 0, out)
-    def test_sem_home_definido_o_script_nao_quebra(self):
+
+    def test_without_home_defined_the_script_does_not_break(self):
         """HOME may be missing (cron, systemd, env -i). With `set -u` the script must
         not die with 'parameter not set', nor exit with the 2 of the safety rejection."""
         env = dict(os.environ)
